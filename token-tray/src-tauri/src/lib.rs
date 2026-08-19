@@ -2,19 +2,28 @@ mod autostart;
 mod usage;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WindowEvent};
+use tauri::tray::TrayIconBuilder;
+#[cfg(not(target_os = "macos"))]
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+#[cfg(not(target_os = "macos"))]
+use tauri::Manager;
+use tauri::WindowEvent;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let autostart_enabled = autostart::initialize().unwrap_or_else(|error| {
-                eprintln!("无法启用开机自启: {error}");
-                true
-            });
+            let autostart_enabled = if cfg!(debug_assertions) {
+                false
+            } else {
+                autostart::initialize().unwrap_or_else(|error| {
+                    eprintln!("无法启用开机自启: {error}");
+                    true
+                })
+            };
 
+            #[cfg(not(target_os = "macos"))]
             let show = MenuItem::with_id(app, "show", "打开统计面板", true, None::<&str>)?;
             let autostart = CheckMenuItem::with_id(
                 app,
@@ -25,13 +34,17 @@ pub fn run() {
                 None::<&str>,
             )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            #[cfg(not(target_os = "macos"))]
             let menu = Menu::with_items(app, &[&show, &autostart, &quit])?;
+            #[cfg(target_os = "macos")]
+            let menu = Menu::with_items(app, &[&autostart, &quit])?;
 
             #[allow(unused_mut)]
             let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
+                    #[cfg(not(target_os = "macos"))]
                     "show" => show_main_window(app),
                     "autostart" => {
                         let enabled = autostart.is_checked().unwrap_or(autostart_enabled);
@@ -42,8 +55,11 @@ pub fn run() {
                     }
                     "quit" => app.exit(0),
                     _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
+                });
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                tray_builder = tray_builder.on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
@@ -53,6 +69,7 @@ pub fn run() {
                         show_main_window(tray.app_handle());
                     }
                 });
+            }
 
             #[cfg(target_os = "macos")]
             {
@@ -117,6 +134,7 @@ fn format_tokens(value: i64) -> String {
     formatted
 }
 
+#[cfg(not(target_os = "macos"))]
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = position_taskbar_window(&window);
@@ -234,7 +252,7 @@ fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn position_taskbar_window(_window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
