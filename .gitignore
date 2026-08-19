@@ -1,0 +1,23 @@
+# Node and frontend build output
+token-tray/node_modules/
+token-tray/dist/
+token-tray/.vite/
+
+# Tauri and Rust build output
+token-tray/src-tauri/target/
+
+# Local databases and environment files
+*.db
+*.sqlite
+*.sqlite3
+*.local
+.env
+.env.*
+!.env.example
+
+# Logs and editor files
+*.log
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,240 @@
+mod autostart;
+mod usage;
+
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let autostart_enabled = autostart::initialize().unwrap_or_else(|error| {
+                eprintln!("无法启用开机自启: {error}");
+                true
+            });
+
+            let show = MenuItem::with_id(app, "show", "打开统计面板", true, None::<&str>)?;
+            let autostart = CheckMenuItem::with_id(
+                app,
+                "autostart",
+                "开机启动",
+                true,
+                autostart_enabled,
+                None::<&str>,
+            )?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &autostart, &quit])?;
+
+            #[allow(unused_mut)]
+            let mut tray_builder = TrayIconBuilder::new()
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "autostart" => {
+                        let enabled = autostart.is_checked().unwrap_or(autostart_enabled);
+                        if let Err(error) = autostart::set_enabled(enabled) {
+                            eprintln!("无法更新开机自启: {error}");
+                            let _ = autostart.set_checked(!enabled);
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+
+            #[cfg(target_os = "macos")]
+            {
+                tray_builder = tray_builder.title("0");
+            }
+            let tray = tray_builder.build(app)?;
+            #[cfg(not(target_os = "macos"))]
+            let _ = &tray;
+
+            #[cfg(target_os = "macos")]
+            {
+                let tray = tray.clone();
+                std::thread::spawn(move || loop {
+                    if let Ok(total) = usage::today_total_tokens() {
+                        let _ = tray.set_title(Some(format_tokens(total)));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                });
+            }
+
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_decorations(false)?;
+                window.set_always_on_top(true)?;
+                window.set_skip_taskbar(true)?;
+                window.set_resizable(false)?;
+                position_taskbar_window(&window).map_err(std::io::Error::other)?;
+                window.show()?;
+
+                let recovery_window = window.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    if position_taskbar_window(&recovery_window).is_ok() {
+                        let _ = recovery_window.show();
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![usage::get_usage_snapshot])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[cfg(target_os = "macos")]
+fn format_tokens(value: i64) -> String {
+    let digits = value.max(0).to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = position_taskbar_window(&window);
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowExW, FindWindowW, GetParent, GetWindowRect, SetParent, SetWindowLongPtrW,
+        SetWindowPos, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, WS_CHILD, WS_EX_NOACTIVATE, WS_VISIBLE,
+    };
+
+    const BASE_WIDTH: i32 = 140;
+    const BASE_HEIGHT: i32 = 38;
+    const BASE_DPI: u32 = 96;
+    const GAP: i32 = 8;
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let taskbar_class = wide("Shell_TrayWnd");
+    let tray_class = wide("TrayNotifyWnd");
+    let taskbar = unsafe { FindWindowW(taskbar_class.as_ptr(), std::ptr::null()) };
+    if taskbar.is_null() {
+        return Err("找不到 Windows 任务栏".to_string());
+    }
+
+    let tray = unsafe {
+        FindWindowExW(
+            taskbar,
+            std::ptr::null_mut(),
+            tray_class.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    let mut taskbar_rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let mut tray_rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(taskbar, &mut taskbar_rect) } == 0 {
+        return Err("无法读取 Windows 任务栏位置".to_string());
+    }
+    let tray_left = if !tray.is_null() && unsafe { GetWindowRect(tray, &mut tray_rect) } != 0 {
+        tray_rect.left
+    } else {
+        taskbar_rect.right - 8
+    };
+
+    let taskbar_width = taskbar_rect.right - taskbar_rect.left;
+    let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
+    let app_hwnd = window.hwnd().map_err(|error| error.to_string())?.0;
+    let dpi = unsafe { GetDpiForWindow(app_hwnd) }.max(BASE_DPI);
+    let width = ((BASE_WIDTH as u32 * dpi + BASE_DPI / 2) / BASE_DPI) as i32;
+    let height = ((BASE_HEIGHT as u32 * dpi + BASE_DPI / 2) / BASE_DPI) as i32;
+    let child_style = WS_CHILD | WS_VISIBLE;
+    let child_ex_style = WS_EX_NOACTIVATE;
+
+    if unsafe { GetParent(app_hwnd) } != taskbar {
+        if unsafe { SetParent(app_hwnd, taskbar) }.is_null() {
+            return Err("无法将统计卡片挂载到 Windows 任务栏".to_string());
+        }
+    }
+
+    let horizontal = taskbar_width >= taskbar_height;
+    let (x, y) = if horizontal {
+        (
+            (tray_left - width - GAP).clamp(taskbar_rect.left + 4, taskbar_rect.right - width - 4),
+            (taskbar_rect.top + ((taskbar_height - height) / 2).max(0))
+                .clamp(taskbar_rect.top + 4, taskbar_rect.bottom - height - 4),
+        )
+    } else {
+        (
+            (taskbar_rect.left + ((taskbar_width - width) / 2).max(0))
+                .clamp(taskbar_rect.left + 4, taskbar_rect.right - width - 4),
+            (if !tray.is_null() {
+                tray_rect.top - height - GAP
+            } else {
+                taskbar_rect.bottom - height - GAP
+            })
+            .clamp(taskbar_rect.top + 4, taskbar_rect.bottom - height - 4),
+        )
+    };
+
+    unsafe {
+        SetWindowLongPtrW(app_hwnd, GWL_STYLE, child_style as isize);
+        SetWindowLongPtrW(app_hwnd, GWL_EXSTYLE, child_ex_style as isize);
+        if SetWindowPos(
+            app_hwnd,
+            HWND_TOP,
+            x - taskbar_rect.left,
+            y - taskbar_rect.top,
+            width,
+            height,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        ) == 0
+        {
+            return Err("无法设置任务栏卡片位置".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn position_taskbar_window(_window: &tauri::WebviewWindow) -> Result<(), String> {
+    Ok(())
+}
