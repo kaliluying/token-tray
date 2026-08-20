@@ -144,6 +144,15 @@ fn show_main_window(app: &tauri::AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
+fn clamp_position(value: i32, min: i32, max: i32) -> i32 {
+    if min <= max {
+        value.clamp(min, max)
+    } else {
+        min.saturating_add(max.saturating_sub(min) / 2)
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -204,6 +213,8 @@ fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> 
     let dpi = unsafe { GetDpiForWindow(app_hwnd) }.max(BASE_DPI);
     let width = ((BASE_WIDTH as u32 * dpi + BASE_DPI / 2) / BASE_DPI) as i32;
     let height = ((BASE_HEIGHT as u32 * dpi + BASE_DPI / 2) / BASE_DPI) as i32;
+    let horizontal_padding = ((taskbar_width - width).max(0) / 2).min(4);
+    let vertical_padding = ((taskbar_height - height).max(0) / 2).min(4);
     let child_style = WS_CHILD | WS_VISIBLE;
     let child_ex_style = WS_EX_NOACTIVATE;
 
@@ -216,20 +227,33 @@ fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> 
     let horizontal = taskbar_width >= taskbar_height;
     let (x, y) = if horizontal {
         (
-            (tray_left - width - GAP).clamp(taskbar_rect.left + 4, taskbar_rect.right - width - 4),
-            (taskbar_rect.top + ((taskbar_height - height) / 2).max(0))
-                .clamp(taskbar_rect.top + 4, taskbar_rect.bottom - height - 4),
+            clamp_position(
+                tray_left - width - GAP,
+                taskbar_rect.left + horizontal_padding,
+                taskbar_rect.right - width - horizontal_padding,
+            ),
+            clamp_position(
+                taskbar_rect.top + ((taskbar_height - height) / 2).max(0),
+                taskbar_rect.top + vertical_padding,
+                taskbar_rect.bottom - height - vertical_padding,
+            ),
         )
     } else {
         (
-            (taskbar_rect.left + ((taskbar_width - width) / 2).max(0))
-                .clamp(taskbar_rect.left + 4, taskbar_rect.right - width - 4),
-            (if !tray.is_null() {
-                tray_rect.top - height - GAP
-            } else {
-                taskbar_rect.bottom - height - GAP
-            })
-            .clamp(taskbar_rect.top + 4, taskbar_rect.bottom - height - 4),
+            clamp_position(
+                taskbar_rect.left + ((taskbar_width - width) / 2).max(0),
+                taskbar_rect.left + horizontal_padding,
+                taskbar_rect.right - width - horizontal_padding,
+            ),
+            clamp_position(
+                if !tray.is_null() {
+                    tray_rect.top - height - GAP
+                } else {
+                    taskbar_rect.bottom - height - GAP
+                },
+                taskbar_rect.top + vertical_padding,
+                taskbar_rect.bottom - height - vertical_padding,
+            ),
         )
     };
 
@@ -250,6 +274,22 @@ fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::clamp_position;
+
+    #[test]
+    fn handles_taskbar_range_smaller_than_widget() {
+        assert_eq!(clamp_position(1041, 1044, 1038), 1041);
+    }
+
+    #[test]
+    fn clamps_normal_taskbar_range() {
+        assert_eq!(clamp_position(5, 10, 20), 10);
+        assert_eq!(clamp_position(25, 10, 20), 20);
+    }
 }
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
