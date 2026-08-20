@@ -1,19 +1,25 @@
 mod autostart;
+mod diagnostics;
 mod usage;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-#[cfg(not(target_os = "macos"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-#[cfg(not(target_os = "macos"))]
 use tauri::Manager;
 use tauri::WindowEvent;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(usage::UsageStore::default())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let _ = show_details_window(app.clone());
+        }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            diagnostics::record(app.handle(), "lifecycle", "started");
             let autostart_enabled = if cfg!(debug_assertions) {
                 false
             } else {
@@ -23,7 +29,6 @@ pub fn run() {
                 })
             };
 
-            #[cfg(not(target_os = "macos"))]
             let show = MenuItem::with_id(app, "show", "打开统计面板", true, None::<&str>)?;
             let autostart = CheckMenuItem::with_id(
                 app,
@@ -34,18 +39,22 @@ pub fn run() {
                 None::<&str>,
             )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            #[cfg(not(target_os = "macos"))]
             let menu = Menu::with_items(app, &[&show, &autostart, &quit])?;
-            #[cfg(target_os = "macos")]
-            let menu = Menu::with_items(app, &[&autostart, &quit])?;
 
             #[allow(unused_mut)]
-            let mut tray_builder = TrayIconBuilder::new()
+            let mut tray_builder = TrayIconBuilder::with_id("token-tray")
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or_else(|| "找不到应用图标资源".to_string())?,
+                )
+                .tooltip("Token Tray")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
-                    #[cfg(not(target_os = "macos"))]
-                    "show" => show_main_window(app),
+                    "show" => {
+                        let _ = show_details_window(app.clone());
+                    }
                     "autostart" => {
                         let enabled = autostart.is_checked().unwrap_or(autostart_enabled);
                         if let Err(error) = autostart::set_enabled(enabled) {
@@ -57,7 +66,6 @@ pub fn run() {
                     _ => {}
                 });
 
-            #[cfg(not(target_os = "macos"))]
             {
                 tray_builder = tray_builder.on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -66,7 +74,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        show_main_window(tray.app_handle());
+                        let _ = toggle_details_window(tray.app_handle().clone());
                     }
                 });
             }
@@ -76,19 +84,8 @@ pub fn run() {
                 tray_builder = tray_builder.title("0");
             }
             let tray = tray_builder.build(app)?;
-            #[cfg(not(target_os = "macos"))]
-            let _ = &tray;
-
-            #[cfg(target_os = "macos")]
-            {
-                let tray = tray.clone();
-                std::thread::spawn(move || loop {
-                    if let Ok(total) = usage::today_total_tokens() {
-                        let _ = tray.set_title(Some(format_tokens(total)));
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                });
-            }
+            let store = app.state::<usage::UsageStore>().inner().clone();
+            usage::start_sync_worker(app.handle().clone(), tray.clone(), store);
 
             #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {
@@ -110,37 +107,136 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            WindowEvent::Focused(false) if window.label() == "details" => {
+                let cursor_is_over_taskbar = window
+                    .app_handle()
+                    .get_webview_window("main")
+                    .map(|main| cursor_over_window(&main).unwrap_or(false))
+                    .unwrap_or(false);
+                if !cursor_is_over_taskbar {
+                    let _ = window.hide();
+                }
+            }
+            _ => {}
         })
-        .invoke_handler(tauri::generate_handler![usage::get_usage_snapshot])
+        .invoke_handler(tauri::generate_handler![
+            usage::get_usage_snapshot,
+            usage::sync_usage_now,
+            show_details_window,
+            toggle_details_window,
+            hide_details_window
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
-#[cfg(target_os = "macos")]
-fn format_tokens(value: i64) -> String {
-    let digits = value.max(0).to_string();
-    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            formatted.push(',');
+#[tauri::command]
+fn show_details_window(app: tauri::AppHandle) -> Result<(), String> {
+    let details = app
+        .get_webview_window("details")
+        .ok_or_else(|| "找不到详情窗口".to_string())?;
+
+    if let Some(main) = app.get_webview_window("main") {
+        if main.is_visible().unwrap_or(false) {
+            position_details_window(&main, &details)?;
+        } else {
+            details.center().map_err(|error| error.to_string())?;
         }
-        formatted.push(digit);
+    } else {
+        details.center().map_err(|error| error.to_string())?;
     }
-    formatted
+
+    details.show().map_err(|error| error.to_string())?;
+    details.set_focus().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn show_main_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = position_taskbar_window(&window);
-        let _ = window.show();
-        let _ = window.set_focus();
+#[tauri::command]
+fn toggle_details_window(app: tauri::AppHandle) -> Result<(), String> {
+    let details = app
+        .get_webview_window("details")
+        .ok_or_else(|| "找不到详情窗口".to_string())?;
+
+    if details.is_visible().unwrap_or(false) {
+        details.hide().map_err(|error| error.to_string())
+    } else {
+        show_details_window(app)
     }
+}
+
+#[tauri::command]
+fn hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(details) = app.get_webview_window("details") {
+        details.hide().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn position_details_window(
+    anchor: &tauri::WebviewWindow,
+    details: &tauri::WebviewWindow,
+) -> Result<(), String> {
+    let anchor_position = anchor.outer_position().map_err(|error| error.to_string())?;
+    let anchor_size = anchor.outer_size().map_err(|error| error.to_string())?;
+    let details_size = details.outer_size().map_err(|error| error.to_string())?;
+    let width = details_size.width.max(1) as i32;
+    let height = details_size.height.max(1) as i32;
+    let anchor_width = anchor_size.width as i32;
+    let anchor_height = anchor_size.height as i32;
+    let mut x = anchor_position.x + (anchor_width - width) / 2;
+    let mut y = anchor_position.y - height - 10;
+
+    if let Some(monitor) = anchor
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| details.current_monitor().ok().flatten())
+    {
+        let work_area = monitor.work_area();
+        let left = work_area.position.x;
+        let top = work_area.position.y;
+        let right = left.saturating_add(work_area.size.width as i32);
+        let bottom = top.saturating_add(work_area.size.height as i32);
+        let max_x = (right - width).max(left);
+        let max_y = (bottom - height).max(top);
+
+        if y < top {
+            y = anchor_position.y + anchor_height + 10;
+        }
+        x = x.max(left).min(max_x);
+        y = y.max(top).min(max_y);
+    }
+
+    details
+        .set_position(tauri::PhysicalPosition::new(x, y))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn cursor_over_window(window: &tauri::WebviewWindow) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let position = window.outer_position().map_err(|error| error.to_string())?;
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let mut cursor = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut cursor) } == 0 {
+        return Err("无法读取鼠标位置".to_string());
+    }
+
+    let right = position.x.saturating_add(size.width as i32);
+    let bottom = position.y.saturating_add(size.height as i32);
+    Ok(cursor.x >= position.x && cursor.x < right && cursor.y >= position.y && cursor.y < bottom)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cursor_over_window(_window: &tauri::WebviewWindow) -> Result<bool, String> {
+    Ok(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -155,6 +251,7 @@ fn clamp_position(value: i32, min: i32, max: i32) -> i32 {
 #[cfg(target_os = "windows")]
 fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowExW, FindWindowW, GetParent, GetWindowRect, SetParent, SetWindowLongPtrW,
@@ -256,6 +353,25 @@ fn position_taskbar_window(window: &tauri::WebviewWindow) -> Result<(), String> 
             ),
         )
     };
+
+    let corner_radius = ((10 * dpi + BASE_DPI / 2) / BASE_DPI) as i32;
+    let region = unsafe {
+        CreateRoundRectRgn(
+            0,
+            0,
+            width + 1,
+            height + 1,
+            corner_radius * 2,
+            corner_radius * 2,
+        )
+    };
+    if region.is_null() {
+        return Err("无法创建任务栏圆角区域".to_string());
+    }
+    if unsafe { SetWindowRgn(app_hwnd, region, 1) } == 0 {
+        unsafe { DeleteObject(region as _) };
+        return Err("无法设置任务栏圆角区域".to_string());
+    }
 
     unsafe {
         SetWindowLongPtrW(app_hwnd, GWL_STYLE, child_style as isize);

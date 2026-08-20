@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Token 概览",
         "width": 140,
         "height": 38,
@@ -20,6 +21,20 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": false,
+        "transparent": true,
+        "visible": false
+      },
+      {
+        "label": "details",
+        "title": "Token 详情",
+        "width": 380,
+        "height": 480,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "transparent": true,
         "visible": false
       }
     ],
@@ -30,6 +45,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -37,5 +53,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQxRkE0RDQwQjc0NEI0MUMKUldRY3RFUzNRRTM2UVZpbmxKZ09vRjV2TjRYZ003VVR1S3hGODU4MGJvc3JlM1NmbmxzVmpMOEkK",
+      "endpoints": [
+        "https://github.com/kaliluying/token-tray/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
