@@ -15,12 +15,6 @@ type TokenTotals = {
   totalTokens: number;
 };
 
-type AppUsage = {
-  appType: string;
-  totalTokens: number;
-  requests: number;
-};
-
 type DailyUsage = {
   date: string;
   totalTokens: number;
@@ -33,9 +27,18 @@ type UsageSnapshot = {
   total: TokenTotals;
   lastSevenDays: TokenTotals;
   daily: DailyUsage[];
-  byApp: AppUsage[];
   updatedAt: string;
   source: string;
+};
+
+type BalanceSnapshot = {
+  configured: boolean;
+  name: string;
+  remaining: number | null;
+  unit: string;
+  updatedAt: number | null;
+  configPath: string;
+  error: string | null;
 };
 
 type UsageUpdate = {
@@ -46,9 +49,12 @@ type UsageUpdate = {
 
 type DetailsPanelProps = {
   snapshot: UsageSnapshot;
+  balance: BalanceSnapshot;
   error: string;
   lastSyncedAt: number | null;
   onRefresh: () => Promise<void>;
+  onRefreshBalance: () => Promise<void>;
+  onOpenBalanceConfig: () => Promise<void>;
 };
 
 const currentAppWindow = getCurrentWindow();
@@ -69,21 +75,28 @@ const emptySnapshot: UsageSnapshot = {
   total: emptyTotals,
   lastSevenDays: emptyTotals,
   daily: [],
-  byApp: [],
   updatedAt: "",
   source: "",
 };
 
-const appLabels: Record<string, string> = {
-  claude: "Claude",
-  codex: "Codex",
-  gemini: "Gemini",
-  grok: "Grok",
-  grokbuild: "Grok Build",
+const emptyBalance: BalanceSnapshot = {
+  configured: false,
+  name: "自定义余额",
+  remaining: null,
+  unit: "",
+  updatedAt: null,
+  configPath: "",
+  error: null,
 };
 
 function formatTokens(value: number) {
   return Math.max(0, value).toLocaleString("en-US");
+}
+
+function formatBalance(value: number) {
+  return value.toLocaleString("en-US", {
+    maximumFractionDigits: 6,
+  });
 }
 
 function formatCacheHitRate(totals: TokenTotals) {
@@ -112,10 +125,6 @@ function formatSyncTime(timestamp: number | null) {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-function formatAppLabel(value: string) {
-  return appLabels[value.toLowerCase()] ?? value;
 }
 
 function formatChartDate(value: string) {
@@ -246,7 +255,15 @@ function UsageTrendChart({ points: sourcePoints }: { points: DailyUsage[] }) {
   );
 }
 
-function DetailsPanel({ snapshot, error, lastSyncedAt, onRefresh }: DetailsPanelProps) {
+function DetailsPanel({
+  snapshot,
+  balance,
+  error,
+  lastSyncedAt,
+  onRefresh,
+  onRefreshBalance,
+  onOpenBalanceConfig,
+}: DetailsPanelProps) {
   const { today } = snapshot;
   const overview = [
     { label: "近 7 天", value: snapshot.lastSevenDays.totalTokens },
@@ -273,6 +290,45 @@ function DetailsPanel({ snapshot, error, lastSyncedAt, onRefresh }: DetailsPanel
         </div>
         <span>tokens</span>
         <p>{today.requests.toLocaleString("en-US")} 次请求</p>
+      </section>
+
+      <section className="balance-card" aria-label="余额" aria-live="polite">
+        <div className="balance-card-heading">
+          <div>
+            <span className="balance-kicker">余额</span>
+            <h2>{balance.name}</h2>
+          </div>
+          <div className="balance-actions">
+            <button className="balance-action" type="button" onClick={() => void onRefreshBalance()}>
+              刷新
+            </button>
+            <button
+              className="balance-action is-muted"
+              type="button"
+              onClick={() => void onOpenBalanceConfig()}
+              title={balance.configPath || undefined}
+            >
+              配置
+            </button>
+          </div>
+        </div>
+        {balance.remaining !== null ? (
+          <div className="balance-value">
+            <strong>{formatBalance(balance.remaining)}</strong>
+            <span>{balance.unit || "USD"}</span>
+          </div>
+        ) : (
+          <p className="balance-empty">
+            {balance.configured ? "暂时无法读取余额" : "尚未配置余额接口"}
+          </p>
+        )}
+        <p className={balance.error ? "balance-meta is-error" : "balance-meta"} title={balance.configPath || undefined}>
+          {balance.error
+            ? balance.error
+            : balance.updatedAt
+              ? `最近更新 ${formatSyncTime(balance.updatedAt)}`
+              : "点击“配置”创建 balance.json"}
+        </p>
       </section>
 
       <section className="overview-grid" aria-label="用量概览">
@@ -305,21 +361,6 @@ function DetailsPanel({ snapshot, error, lastSyncedAt, onRefresh }: DetailsPanel
         </div>
       </section>
 
-      <section className="details-section">
-        <div className="section-heading">
-          <h2>按应用</h2>
-          <span>累计 token</span>
-        </div>
-        <div className="app-list">
-          {snapshot.byApp.length > 0 ? snapshot.byApp.slice(0, 4).map((app) => (
-            <div className="app-row" key={app.appType}>
-              <div className="app-name"><span className="app-dot" />{formatAppLabel(app.appType)}</div>
-              <strong>{formatTokens(app.totalTokens)}</strong>
-            </div>
-          )) : <p className="empty-state">暂无应用统计</p>}
-        </div>
-      </section>
-
       <footer className="details-footer">
         <span className={error ? "sync-state is-error" : "sync-state"} title={error || undefined}>
           {error ? "同步失败，保留上次数据" : `最近同步 ${formatSyncTime(lastSyncedAt)}`}
@@ -334,6 +375,7 @@ function DetailsPanel({ snapshot, error, lastSyncedAt, onRefresh }: DetailsPanel
 
 function App() {
   const [snapshot, setSnapshot] = useState<UsageSnapshot>(emptySnapshot);
+  const [balance, setBalance] = useState<BalanceSnapshot>(emptyBalance);
   const [displayedTokens, setDisplayedTokens] = useState(0);
   const [error, setError] = useState("");
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
@@ -354,6 +396,15 @@ function App() {
     }
   }, [applyUpdate]);
 
+  const readBalance = useCallback(async () => {
+    try {
+      const result = await invoke<BalanceSnapshot>("get_balance");
+      setBalance(result);
+    } catch (_reason) {
+      setBalance((current) => ({ ...current, error: "读取余额失败" }));
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const update = await invoke<UsageUpdate>("sync_usage_now");
@@ -361,7 +412,17 @@ function App() {
     } catch (reason) {
       setError(String(reason));
     }
-  }, [applyUpdate]);
+    await readBalance();
+  }, [applyUpdate, readBalance]);
+
+  const openBalanceConfig = useCallback(async () => {
+    try {
+      const configPath = await invoke<string>("open_balance_config");
+      setBalance((current) => ({ ...current, configPath, error: null }));
+    } catch (_reason) {
+      setBalance((current) => ({ ...current, error: "无法打开余额配置文件" }));
+    }
+  }, []);
 
   useEffect(() => {
     document.body.dataset.window = currentWindowLabel;
@@ -415,6 +476,16 @@ function App() {
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, []);
+
+  useEffect(() => {
+    if (currentWindowLabel !== "details") return;
+
+    void readBalance();
+    const interval = window.setInterval(() => {
+      void readBalance();
+    }, 30_000);
+    return () => window.clearInterval(interval);
+  }, [readBalance]);
 
   useEffect(() => {
     if (currentWindowLabel !== "main" || import.meta.env.DEV) return;
@@ -471,9 +542,12 @@ function App() {
     return (
       <DetailsPanel
         snapshot={snapshot}
+        balance={balance}
         error={error}
         lastSyncedAt={lastSyncedAt}
         onRefresh={refresh}
+        onRefreshBalance={readBalance}
+        onOpenBalanceConfig={openBalanceConfig}
       />
     );
   }

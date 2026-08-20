@@ -1,4 +1,5 @@
 mod autostart;
+mod balance;
 mod diagnostics;
 mod usage;
 
@@ -125,6 +126,8 @@ pub fn run() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
+            balance::get_balance,
+            balance::open_balance_config,
             usage::get_usage_snapshot,
             usage::sync_usage_now,
             show_details_window,

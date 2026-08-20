@@ -29,6 +29,43 @@ macOS:   ~/.cc-switch/cc-switch.db、~/Library/Application Support/cc-switch/cc-
 
 也可以通过 `CC_SWITCH_DB_PATH` 指定数据库文件。数据库以只读方式打开，不修改 CC Switch 数据。
 
+## 自定义余额
+
+详情面板的“余额”卡片支持按 CC Switch 的请求模板读取自定义接口。点击卡片右上角“配置”，应用会创建并打开：
+
+```text
+Windows: %APPDATA%\com.token-tray.app\balance.json
+macOS:   ~/Library/Application Support/com.token-tray.app/balance.json
+```
+
+配置示例：
+
+```json
+{
+  "name": "PhotonMark",
+  "apiKey": "",
+  "request": {
+    "url": "https://codex.photonmark.com/api/v1/services/pay/status",
+    "method": "GET",
+    "headers": {
+      "Authorization": "Bearer {{apiKey}}"
+    }
+  },
+  "extractor": {
+    "path": "balance_usd",
+    "unit": "USD"
+  }
+}
+```
+
+上面的 `extractor` 等价于 CC Switch 模板中的 `+response.balance_usd`。也支持把 extractor 写成 JSON 字符串形式的 CC Switch 函数，例如：
+
+```json
+"extractor": "function(response) { return { remaining: +response.balance_usd, unit: \"USD\" }; }"
+```
+
+请求头中的 `{{apiKey}}` 会替换为配置里的 API Key；也可以改用 `apiKeyEnv`，从环境变量读取密钥。余额请求不会把 API Key、响应正文或请求内容写入诊断日志，接口响应仅接受 JSON，超时时间为 8 秒。
+
 ## 开发
 
 需要 Node.js、pnpm 和 Rust。
