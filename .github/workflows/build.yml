@@ -41,7 +41,7 @@ jobs:
 
       - name: Build installers
         working-directory: token-tray
-        run: pnpm tauri build --no-sign --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        run: pnpm tauri build --no-sign --config src-tauri/tauri.ci.conf.json
 
       - name: Upload installers
         uses: actions/upload-artifact@v4
