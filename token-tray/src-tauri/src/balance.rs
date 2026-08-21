@@ -3,7 +3,8 @@ use std::env;
 use std::fs::{self, create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -15,6 +16,7 @@ use tauri_plugin_opener::OpenerExt;
 
 const CONFIG_FILE_NAME: &str = "balance.json";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const BALANCE_CACHE_TTL: Duration = Duration::from_secs(5);
 
 const SAMPLE_CONFIG: &str = r#"{
   "name": "PhotonMark",
@@ -43,6 +45,40 @@ pub struct BalanceSnapshot {
     pub updated_at: Option<i64>,
     pub config_path: String,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+pub struct BalanceStore {
+    cache: Arc<Mutex<Option<CachedBalance>>>,
+}
+
+struct CachedBalance {
+    fetched_at: Instant,
+    snapshot: BalanceSnapshot,
+}
+
+impl BalanceStore {
+    fn get_or_fetch<F>(&self, fetch: F) -> BalanceSnapshot
+    where
+        F: FnOnce() -> BalanceSnapshot,
+    {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.as_ref() {
+            if cached.fetched_at.elapsed() < BALANCE_CACHE_TTL {
+                return cached.snapshot.clone();
+            }
+        }
+
+        let snapshot = fetch();
+        *cache = Some(CachedBalance {
+            fetched_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,8 +122,23 @@ fn default_method() -> String {
 }
 
 #[tauri::command]
-pub fn get_balance(app: AppHandle) -> BalanceSnapshot {
-    let path = match balance_config_path(&app) {
+pub async fn get_balance(app: AppHandle) -> BalanceSnapshot {
+    let store = app.state::<BalanceStore>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store.get_or_fetch(|| read_balance_snapshot(&app)))
+        .await
+        .unwrap_or_else(|_| BalanceSnapshot {
+            configured: true,
+            name: "余额查询".to_string(),
+            remaining: None,
+            unit: String::new(),
+            updated_at: None,
+            config_path: String::new(),
+            error: Some("余额查询线程失败".to_string()),
+        })
+}
+
+fn read_balance_snapshot(app: &AppHandle) -> BalanceSnapshot {
+    let path = match balance_config_path(app) {
         Ok(path) => path,
         Err(error) => {
             return BalanceSnapshot {
@@ -451,5 +502,57 @@ mod tests {
             result,
             ("Local fixture".to_string(), 12.5, "USD".to_string())
         );
+    }
+
+    #[test]
+    fn coalesces_concurrent_balance_fetches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let store = super::BalanceStore::default();
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_store = store.clone();
+        let first_count = fetch_count.clone();
+        let first_barrier = barrier.clone();
+        let first = thread::spawn(move || {
+            first_barrier.wait();
+            first_store.get_or_fetch(|| {
+                first_count.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(25));
+                test_balance_snapshot(1.0)
+            })
+        });
+
+        let second_store = store.clone();
+        let second_count = fetch_count.clone();
+        let second_barrier = barrier.clone();
+        let second = thread::spawn(move || {
+            second_barrier.wait();
+            second_store.get_or_fetch(|| {
+                second_count.fetch_add(1, Ordering::SeqCst);
+                test_balance_snapshot(2.0)
+            })
+        });
+
+        let first_result = first.join().expect("first fetch thread");
+        let second_result = second.join().expect("second fetch thread");
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(first_result.remaining, second_result.remaining);
+    }
+
+    fn test_balance_snapshot(remaining: f64) -> super::BalanceSnapshot {
+        super::BalanceSnapshot {
+            configured: true,
+            name: "Test".to_string(),
+            remaining: Some(remaining),
+            unit: "USD".to_string(),
+            updated_at: Some(1),
+            config_path: String::new(),
+            error: None,
+        }
     }
 }

@@ -13,6 +13,7 @@ use tauri::WindowEvent;
 pub fn run() {
     tauri::Builder::default()
         .manage(usage::UsageStore::default())
+        .manage(balance::BalanceStore::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_details_window(app.clone());
         }))

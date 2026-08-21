@@ -99,6 +99,13 @@ function formatBalance(value: number) {
   });
 }
 
+function formatBalanceStatus(balance: BalanceSnapshot) {
+  if (balance.remaining !== null) {
+    return `余额 ${formatBalance(balance.remaining)} ${balance.unit || "USD"}`;
+  }
+  return balance.configured ? "余额读取失败" : "余额未配置";
+}
+
 function formatCacheHitRate(totals: TokenTotals) {
   const inputTokens = Math.max(0, totals.inputTokens);
   const cacheReadTokens = Math.max(0, totals.cacheReadTokens);
@@ -380,6 +387,7 @@ function App() {
   const [error, setError] = useState("");
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
   const displayedTokensRef = useRef(0);
+  const balanceRequestInFlightRef = useRef(false);
 
   const applyUpdate = useCallback((update: UsageUpdate) => {
     setSnapshot(update.snapshot);
@@ -397,11 +405,15 @@ function App() {
   }, [applyUpdate]);
 
   const readBalance = useCallback(async () => {
+    if (balanceRequestInFlightRef.current) return;
+    balanceRequestInFlightRef.current = true;
     try {
       const result = await invoke<BalanceSnapshot>("get_balance");
       setBalance(result);
     } catch (_reason) {
       setBalance((current) => ({ ...current, error: "读取余额失败" }));
+    } finally {
+      balanceRequestInFlightRef.current = false;
     }
   }, []);
 
@@ -478,7 +490,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (currentWindowLabel !== "details") return;
+    if (currentWindowLabel !== "main" && currentWindowLabel !== "details") return;
 
     void readBalance();
     const interval = window.setInterval(() => {
@@ -571,8 +583,13 @@ function App() {
       role="button"
       tabIndex={0}
     >
-      <strong>{formatTokens(displayedTokens)}</strong>
-      <span className="widget-approximation">{formatTokenApproximation(displayedTokens)}</span>
+      <div className="widget-token-value">
+        <strong>{formatTokens(displayedTokens)}</strong>
+        <span className="widget-approximation">{formatTokenApproximation(displayedTokens)}</span>
+      </div>
+      <span className={balance.error ? "widget-balance is-error" : "widget-balance"}>
+        {formatBalanceStatus(balance)}
+      </span>
     </main>
   );
 }
