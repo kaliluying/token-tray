@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        working-directory: token-tray
+        run: pnpm install --frozen-lockfile
+
+      - name: Build installers
+        working-directory: token-tray
+        run: pnpm tauri build --no-sign --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: token-tray-${{ matrix.os }}-${{ github.sha }}
+          path: token-tray/src-tauri/target/release/bundle/
+          if-no-files-found: error
+          retention-days: 14
