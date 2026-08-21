@@ -41,6 +41,37 @@ type BalanceSnapshot = {
   error: string | null;
 };
 
+type RelayUsageWindow = {
+  requests: number;
+  tokenRequests: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  amountUsd: number | null;
+};
+
+type RelayServiceUsage = {
+  id: string;
+  name: string;
+  status: string;
+  active: boolean | null;
+  balanceUsd: number | null;
+  windows: Record<string, RelayUsageWindow>;
+  error: string | null;
+};
+
+type RelayUsageSnapshot = {
+  configured: boolean;
+  name: string;
+  services: RelayServiceUsage[];
+  updatedAt: number | null;
+  configPath: string;
+  error: string | null;
+};
+
+type StatsMode = "ccswitch" | "photonmark";
+
 type UsageUpdate = {
   snapshot: UsageSnapshot;
   lastSyncedAt: number | null;
@@ -50,11 +81,14 @@ type UsageUpdate = {
 type DetailsPanelProps = {
   snapshot: UsageSnapshot;
   balance: BalanceSnapshot;
+  relayUsage: RelayUsageSnapshot;
   error: string;
   lastSyncedAt: number | null;
   onRefresh: () => Promise<void>;
   onRefreshBalance: () => Promise<void>;
   onOpenBalanceConfig: () => Promise<void>;
+  onRefreshRelayUsage: () => Promise<void>;
+  onOpenRelayConfig: () => Promise<void>;
 };
 
 const currentAppWindow = getCurrentWindow();
@@ -89,6 +123,22 @@ const emptyBalance: BalanceSnapshot = {
   error: null,
 };
 
+const emptyRelayUsage: RelayUsageSnapshot = {
+  configured: false,
+  name: "中转站",
+  services: [],
+  updatedAt: null,
+  configPath: "",
+  error: null,
+};
+
+const relayPeriods = [
+  { key: "5h", label: "5 小时" },
+  { key: "24h", label: "24 小时" },
+  { key: "7d", label: "7 天" },
+  { key: "all", label: "累计" },
+] as const;
+
 function formatTokens(value: number) {
   return Math.max(0, value).toLocaleString("en-US");
 }
@@ -104,6 +154,12 @@ function formatBalanceStatus(balance: BalanceSnapshot) {
     return `余额 ${formatBalance(balance.remaining)} ${balance.unit || "USD"}`;
   }
   return balance.configured ? "余额读取失败" : "余额未配置";
+}
+
+function formatRelayStatus(service: RelayServiceUsage) {
+  if (service.active === true) return "运行中";
+  if (service.active === false) return "未激活";
+  return service.status || "状态未知";
 }
 
 function formatCacheHitRate(totals: TokenTotals) {
@@ -265,41 +321,80 @@ function UsageTrendChart({ points: sourcePoints }: { points: DailyUsage[] }) {
 function DetailsPanel({
   snapshot,
   balance,
+  relayUsage,
   error,
   lastSyncedAt,
   onRefresh,
   onRefreshBalance,
   onOpenBalanceConfig,
+  onRefreshRelayUsage,
+  onOpenRelayConfig,
 }: DetailsPanelProps) {
+  const [statsMode, setStatsMode] = useState<StatsMode>("ccswitch");
   const { today } = snapshot;
   const overview = [
     { label: "近 7 天", value: snapshot.lastSevenDays.totalTokens },
     { label: "本月", value: snapshot.month.totalTokens },
     { label: "累计", value: snapshot.total.totalTokens },
   ];
+  const panelError = statsMode === "photonmark" ? relayUsage.error : error;
+  const panelSyncedAt = statsMode === "photonmark" ? relayUsage.updatedAt : lastSyncedAt;
+  const photonmarkToday = relayUsage.services.reduce(
+    (totals, service) => {
+      const period = service.windows["24h"];
+      if (!period) return totals;
+      return {
+        totalTokens: totals.totalTokens + period.totalTokens,
+        requests: totals.requests + period.requests,
+        hasData: true,
+      };
+    },
+    { totalTokens: 0, requests: 0, hasData: false },
+  );
 
   return (
     <main className="details-page">
       <header className="details-header">
         <div>
           <span className="details-kicker">Token 统计</span>
-          <h1>今日用量</h1>
+          <h1>{statsMode === "ccswitch" ? "今日用量" : "中转站用量"}</h1>
         </div>
         <button className="close-button" type="button" onClick={() => void invoke("hide_details_window")} aria-label="关闭详情面板">
           ×
         </button>
       </header>
 
-      <section className="details-hero">
+      <div className="stats-mode-switch" role="tablist" aria-label="统计来源">
+        <button
+          className={statsMode === "ccswitch" ? "is-active" : ""}
+          type="button"
+          role="tab"
+          aria-selected={statsMode === "ccswitch"}
+          onClick={() => setStatsMode("ccswitch")}
+        >
+          CC Switch
+        </button>
+        <button
+          className={statsMode === "photonmark" ? "is-active" : ""}
+          type="button"
+          role="tab"
+          aria-selected={statsMode === "photonmark"}
+          onClick={() => setStatsMode("photonmark")}
+        >
+          PhotonMark
+        </button>
+      </div>
+
+      {statsMode === "ccswitch" && <section className="details-hero">
         <div className="details-total">
           <strong>{formatTokens(today.totalTokens)}</strong>
           <span className="token-approximation">{formatTokenApproximation(today.totalTokens)}</span>
         </div>
         <span>tokens</span>
         <p>{today.requests.toLocaleString("en-US")} 次请求</p>
-      </section>
+      </section>}
 
-      <section className="balance-card" aria-label="余额" aria-live="polite">
+      {statsMode === "ccswitch" && <section className="balance-card" aria-label="余额" aria-live="polite">
         <div className="balance-card-heading">
           <div>
             <span className="balance-kicker">余额</span>
@@ -336,26 +431,104 @@ function DetailsPanel({
               ? `最近更新 ${formatSyncTime(balance.updatedAt)}`
               : "点击“配置”创建 balance.json"}
         </p>
-      </section>
+      </section>}
 
-      <section className="overview-grid" aria-label="用量概览">
+      {statsMode === "photonmark" && <section className="relay-card" aria-label="中转站 Token 统计" aria-live="polite">
+        <div className="relay-card-heading">
+          <div>
+            <span className="relay-kicker">中转站 Token</span>
+            <h2>{relayUsage.name}</h2>
+          </div>
+          <div className="balance-actions">
+            <button className="balance-action relay-action" type="button" onClick={() => void onRefreshRelayUsage()}>
+              刷新
+            </button>
+            <button
+              className="balance-action is-muted"
+              type="button"
+              onClick={() => void onOpenRelayConfig()}
+              title={relayUsage.configPath || undefined}
+            >
+              配置
+            </button>
+          </div>
+        </div>
+        {!relayUsage.configured ? (
+          <p className="relay-empty">尚未配置中转站接口</p>
+        ) : relayUsage.services.length === 0 ? (
+          <p className="relay-empty">{relayUsage.error || "没有可展示的中转站服务"}</p>
+        ) : (
+          <>
+            <div className="relay-total">
+              <div className="details-total">
+                <strong>{photonmarkToday.hasData ? formatTokens(photonmarkToday.totalTokens) : "—"}</strong>
+                {photonmarkToday.hasData ? (
+                  <span className="token-approximation">{formatTokenApproximation(photonmarkToday.totalTokens)}</span>
+                ) : null}
+              </div>
+              <span>当天总 tokens（24h）· Pay + Boost</span>
+              <p>
+                {photonmarkToday.hasData ? `${formatTokens(photonmarkToday.requests)} 次请求` : "暂无 24 小时数据"}
+              </p>
+            </div>
+            <div className="relay-services">
+            {relayUsage.services.map((service) => (
+              <article className="relay-service-row" key={service.id}>
+                <div className="relay-service-heading">
+                  <div>
+                    <strong>{service.name}</strong>
+                    <span className={service.active ? "relay-status is-active" : "relay-status"}>
+                      {formatRelayStatus(service)}
+                    </span>
+                  </div>
+                  {service.balanceUsd !== null ? (
+                    <span className="relay-balance">余额 {formatBalance(service.balanceUsd)} USD</span>
+                  ) : null}
+                </div>
+                {service.error ? (
+                  <p className="relay-service-error">{service.error}</p>
+                ) : (
+                  <div className="relay-period-grid">
+                    {relayPeriods.map(({ key, label }) => {
+                      const period = service.windows[key];
+                      return (
+                        <div className="relay-period" key={key}>
+                          <span>{label}</span>
+                          <strong>{period ? formatTokens(period.totalTokens) : "—"}</strong>
+                          <small>{period ? `${formatTokens(period.requests)} 次请求` : "暂无数据"}</small>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </article>
+            ))}
+            </div>
+          </>
+        )}
+        <p className={relayUsage.error ? "relay-meta is-error" : "relay-meta"} title={relayUsage.configPath || undefined}>
+          {relayUsage.error || (relayUsage.updatedAt ? `最近更新 ${formatSyncTime(relayUsage.updatedAt)}` : "等待首次同步")}
+        </p>
+      </section>}
+
+      {statsMode === "ccswitch" && <section className="overview-grid" aria-label="用量概览">
         {overview.map((item) => (
           <div className="overview-card" key={item.label}>
             <span>{item.label}</span>
             <strong>{formatTokens(item.value)}</strong>
           </div>
         ))}
-      </section>
+      </section>}
 
-      <section className="details-section trend-section">
+      {statsMode === "ccswitch" && <section className="details-section trend-section">
         <div className="section-heading">
           <h2>近七天趋势</h2>
           <span>{formatTokens(snapshot.lastSevenDays.totalTokens)} tokens · {formatTokenApproximation(snapshot.lastSevenDays.totalTokens)}</span>
         </div>
         <UsageTrendChart points={snapshot.daily} />
-      </section>
+      </section>}
 
-      <section className="details-section">
+      {statsMode === "ccswitch" && <section className="details-section">
         <div className="section-heading">
           <h2>今日明细</h2>
           <span>{today.requests.toLocaleString("en-US")} 次请求</span>
@@ -366,11 +539,11 @@ function DetailsPanel({
           <div className="metric-row"><span>读取缓存</span><strong>{formatTokens(today.cacheReadTokens)}</strong></div>
           <div className="metric-row"><span>缓存命中率</span><strong>{formatCacheHitRate(today)}</strong></div>
         </div>
-      </section>
+      </section>}
 
       <footer className="details-footer">
-        <span className={error ? "sync-state is-error" : "sync-state"} title={error || undefined}>
-          {error ? "同步失败，保留上次数据" : `最近同步 ${formatSyncTime(lastSyncedAt)}`}
+        <span className={panelError ? "sync-state is-error" : "sync-state"} title={panelError || undefined}>
+          {panelError ? "同步失败，保留上次数据" : `最近同步 ${formatSyncTime(panelSyncedAt)}`}
         </span>
         <button className="refresh-button" type="button" onClick={() => void onRefresh()}>
           刷新
@@ -383,11 +556,13 @@ function DetailsPanel({
 function App() {
   const [snapshot, setSnapshot] = useState<UsageSnapshot>(emptySnapshot);
   const [balance, setBalance] = useState<BalanceSnapshot>(emptyBalance);
+  const [relayUsage, setRelayUsage] = useState<RelayUsageSnapshot>(emptyRelayUsage);
   const [displayedTokens, setDisplayedTokens] = useState(0);
   const [error, setError] = useState("");
   const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null);
   const displayedTokensRef = useRef(0);
   const balanceRequestInFlightRef = useRef(false);
+  const relayRequestInFlightRef = useRef(false);
 
   const applyUpdate = useCallback((update: UsageUpdate) => {
     setSnapshot(update.snapshot);
@@ -417,6 +592,19 @@ function App() {
     }
   }, []);
 
+  const readRelayUsage = useCallback(async () => {
+    if (relayRequestInFlightRef.current) return;
+    relayRequestInFlightRef.current = true;
+    try {
+      const result = await invoke<RelayUsageSnapshot>("get_relay_usage");
+      setRelayUsage(result);
+    } catch (_reason) {
+      setRelayUsage((current) => ({ ...current, error: "读取中转站统计失败" }));
+    } finally {
+      relayRequestInFlightRef.current = false;
+    }
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
       const update = await invoke<UsageUpdate>("sync_usage_now");
@@ -424,8 +612,8 @@ function App() {
     } catch (reason) {
       setError(String(reason));
     }
-    await readBalance();
-  }, [applyUpdate, readBalance]);
+    await Promise.all([readBalance(), readRelayUsage()]);
+  }, [applyUpdate, readBalance, readRelayUsage]);
 
   const openBalanceConfig = useCallback(async () => {
     try {
@@ -433,6 +621,15 @@ function App() {
       setBalance((current) => ({ ...current, configPath, error: null }));
     } catch (_reason) {
       setBalance((current) => ({ ...current, error: "无法打开余额配置文件" }));
+    }
+  }, []);
+
+  const openRelayConfig = useCallback(async () => {
+    try {
+      const configPath = await invoke<string>("open_relay_config");
+      setRelayUsage((current) => ({ ...current, configPath, error: null }));
+    } catch (_reason) {
+      setRelayUsage((current) => ({ ...current, error: "无法打开中转站配置文件" }));
     }
   }, []);
 
@@ -493,11 +690,17 @@ function App() {
     if (currentWindowLabel !== "main" && currentWindowLabel !== "details") return;
 
     void readBalance();
-    const interval = window.setInterval(() => {
-      void readBalance();
-    }, 30_000);
-    return () => window.clearInterval(interval);
-  }, [readBalance]);
+    const shouldReadRelayUsage = currentWindowLabel === "details";
+    if (shouldReadRelayUsage) void readRelayUsage();
+    const balanceInterval = window.setInterval(() => void readBalance(), 30_000);
+    const relayInterval = shouldReadRelayUsage
+      ? window.setInterval(() => void readRelayUsage(), 60_000)
+      : undefined;
+    return () => {
+      window.clearInterval(balanceInterval);
+      if (relayInterval) window.clearInterval(relayInterval);
+    };
+  }, [readBalance, readRelayUsage]);
 
   useEffect(() => {
     if (currentWindowLabel !== "main" || import.meta.env.DEV) return;
@@ -555,11 +758,14 @@ function App() {
       <DetailsPanel
         snapshot={snapshot}
         balance={balance}
+        relayUsage={relayUsage}
         error={error}
         lastSyncedAt={lastSyncedAt}
         onRefresh={refresh}
         onRefreshBalance={readBalance}
         onOpenBalanceConfig={openBalanceConfig}
+        onRefreshRelayUsage={readRelayUsage}
+        onOpenRelayConfig={openRelayConfig}
       />
     );
   }

@@ -1,6 +1,7 @@
 mod autostart;
 mod balance;
 mod diagnostics;
+mod relay;
 mod usage;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
@@ -14,6 +15,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(usage::UsageStore::default())
         .manage(balance::BalanceStore::default())
+        .manage(relay::RelayUsageStore::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_details_window(app.clone());
         }))
@@ -129,6 +131,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             balance::get_balance,
             balance::open_balance_config,
+            relay::get_relay_usage,
+            relay::open_relay_config,
             usage::get_usage_snapshot,
             usage::sync_usage_now,
             show_details_window,

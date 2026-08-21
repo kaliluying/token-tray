@@ -43,7 +43,6 @@ macOS:   ~/Library/Application Support/com.token-tray.app/balance.json
 ```json
 {
   "name": "PhotonMark",
-  "apiKey": "",
   "request": {
     "url": "https://codex.photonmark.com/api/v1/services/pay/status",
     "method": "GET",
@@ -65,6 +64,32 @@ macOS:   ~/Library/Application Support/com.token-tray.app/balance.json
 ```
 
 请求头中的 `{{apiKey}}` 会替换为配置里的 API Key；也可以改用 `apiKeyEnv`，从环境变量读取密钥。余额请求不会把 API Key、响应正文或请求内容写入诊断日志，接口响应仅接受 JSON，超时时间为 8 秒。
+
+## 中转站 Token 统计
+
+统计面板会单独读取 `%APPDATA%\com.token-tray.app\relay.json`，按配置中的服务请求分别展示 `pay` 和 `boost` 的 `5h`、`24h`、`7d`、`all` token 统计。点击“配置”会自动创建并打开该文件。
+
+配置示例：
+
+```json
+{
+  "name": "PhotonMark",
+  "apiKey": "",
+  "request": {
+    "url": "https://codex.photonmark.com/api/v1/services/{{service}}/status",
+    "method": "GET",
+    "headers": {
+      "Authorization": "Bearer {{apiKey}}"
+    }
+  },
+  "services": [
+    { "id": "pay", "name": "Pay", "apiKey": "" },
+    { "id": "boost", "name": "Boost", "apiKey": "" }
+  ]
+}
+```
+
+`{{service}}` 会替换成服务 ID。每个服务可以分别配置 `apiKey` 或 `apiKeyEnv`；旧配置中的全局 `apiKey`/`apiKeyEnv` 仍会作为没有服务专属密钥时的回退。
 
 ## 开发
 
