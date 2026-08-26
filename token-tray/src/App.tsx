@@ -346,10 +346,12 @@ function DetailsPanel({
       return {
         totalTokens: totals.totalTokens + period.totalTokens,
         requests: totals.requests + period.requests,
+        amountUsd: totals.amountUsd + (period.amountUsd ?? 0),
         hasData: true,
+        hasAmount: totals.hasAmount || period.amountUsd !== null,
       };
     },
-    { totalTokens: 0, requests: 0, hasData: false },
+    { totalTokens: 0, requests: 0, amountUsd: 0, hasData: false, hasAmount: false },
   );
 
   return (
@@ -469,6 +471,7 @@ function DetailsPanel({
               <span>当天总 tokens（24h）· Pay + Boost</span>
               <p>
                 {photonmarkToday.hasData ? `${formatTokens(photonmarkToday.requests)} 次请求` : "暂无 24 小时数据"}
+                {photonmarkToday.hasAmount ? ` · 余额消耗 ${formatBalance(photonmarkToday.amountUsd)} USD` : null}
               </p>
             </div>
             <div className="relay-services">
