@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
@@ -588,6 +588,13 @@ function App() {
     try {
       const result = await invoke<BalanceSnapshot>("get_balance");
       setBalance(result);
+      if (result.remaining !== null && !result.error) {
+        try {
+          await emit("balance-updated", result);
+        } catch (_reason) {
+          // A sync failure must not turn a successful local read into an error.
+        }
+      }
     } catch (_reason) {
       setBalance((current) => ({ ...current, error: "读取余额失败" }));
     } finally {
@@ -645,17 +652,25 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenUsage: (() => void) | undefined;
+    let unlistenBalance: (() => void) | undefined;
     const setup = async () => {
       try {
-        const dispose = await listen<UsageUpdate>("usage-updated", (event) => {
-          applyUpdate(event.payload);
-        });
+        const [disposeUsage, disposeBalance] = await Promise.all([
+          listen<UsageUpdate>("usage-updated", (event) => {
+            applyUpdate(event.payload);
+          }),
+          listen<BalanceSnapshot>("balance-updated", (event) => {
+            setBalance(event.payload);
+          }),
+        ]);
         if (disposed) {
-          dispose();
+          disposeUsage();
+          disposeBalance();
           return;
         }
-        unlisten = dispose;
+        unlistenUsage = disposeUsage;
+        unlistenBalance = disposeBalance;
         await readCached();
       } catch (reason) {
         setError(String(reason));
@@ -669,12 +684,13 @@ function App() {
     window.addEventListener("focus", refreshWhenActive);
     document.addEventListener("visibilitychange", refreshWhenActive);
 
-    return () => {
-      disposed = true;
-      unlisten?.();
-      window.removeEventListener("focus", refreshWhenActive);
-      document.removeEventListener("visibilitychange", refreshWhenActive);
-    };
+      return () => {
+        disposed = true;
+        unlistenUsage?.();
+        unlistenBalance?.();
+        window.removeEventListener("focus", refreshWhenActive);
+        document.removeEventListener("visibilitychange", refreshWhenActive);
+      };
   }, [applyUpdate, readCached]);
 
   useEffect(() => {
@@ -690,18 +706,15 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (currentWindowLabel !== "main" && currentWindowLabel !== "details") return;
+    if (currentWindowLabel !== "details") return;
 
     void readBalance();
-    const shouldReadRelayUsage = currentWindowLabel === "details";
-    if (shouldReadRelayUsage) void readRelayUsage();
-    const balanceInterval = window.setInterval(() => void readBalance(), 30_000);
-    const relayInterval = shouldReadRelayUsage
-      ? window.setInterval(() => void readRelayUsage(), 60_000)
-      : undefined;
+    void readRelayUsage();
+    const balanceInterval = window.setInterval(() => void readBalance(), 60_000);
+    const relayInterval = window.setInterval(() => void readRelayUsage(), 60_000);
     return () => {
       window.clearInterval(balanceInterval);
-      if (relayInterval) window.clearInterval(relayInterval);
+      window.clearInterval(relayInterval);
     };
   }, [readBalance, readRelayUsage]);
 
