@@ -4,11 +4,34 @@ mod diagnostics;
 mod relay;
 mod usage;
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::Duration;
+
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::Manager;
 use tauri::WindowEvent;
+use tauri::{Emitter, Manager};
+
+const DETAILS_ANIMATION_DURATION_MS: u64 = 180;
+
+#[derive(Clone, Default)]
+struct DetailsWindowState {
+    generation: Arc<AtomicU64>,
+}
+
+impl DetailsWindowState {
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -16,6 +39,7 @@ pub fn run() {
         .manage(usage::UsageStore::default())
         .manage(balance::BalanceStore::default())
         .manage(relay::RelayUsageStore::default())
+        .manage(DetailsWindowState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_details_window(app.clone());
         }))
@@ -123,7 +147,7 @@ pub fn run() {
                     .map(|main| cursor_over_window(&main).unwrap_or(false))
                     .unwrap_or(false);
                 if !cursor_is_over_taskbar {
-                    let _ = window.hide();
+                    let _ = request_hide_details_window(window.app_handle().clone());
                 }
             }
             _ => {}
@@ -148,20 +172,71 @@ fn show_details_window(app: tauri::AppHandle) -> Result<(), String> {
     let details = app
         .get_webview_window("details")
         .ok_or_else(|| "找不到详情窗口".to_string())?;
+    let animation_state = app.state::<DetailsWindowState>().inner().clone();
+    animation_state.next_generation();
 
-    if let Some(main) = app.get_webview_window("main") {
-        if main.is_visible().unwrap_or(false) {
-            position_details_window(&main, &details)?;
+    #[cfg(target_os = "macos")]
+    details
+        .set_visible_on_all_workspaces(true)
+        .map_err(|error| error.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let positioned_from_tray = position_details_window_from_tray(&app, &details)?;
+    #[cfg(not(target_os = "macos"))]
+    let positioned_from_tray = false;
+
+    if !positioned_from_tray {
+        if let Some(main) = app.get_webview_window("main") {
+            if main.is_visible().unwrap_or(false) {
+                position_details_window(&main, &details)?;
+            } else {
+                details.center().map_err(|error| error.to_string())?;
+            }
         } else {
             details.center().map_err(|error| error.to_string())?;
         }
-    } else {
-        details.center().map_err(|error| error.to_string())?;
     }
 
+    let _ = app.emit_to("details", "details-window-opening", ());
     details.show().map_err(|error| error.to_string())?;
     details.set_focus().map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn position_details_window_from_tray(
+    app: &tauri::AppHandle,
+    details: &tauri::WebviewWindow,
+) -> Result<bool, String> {
+    let Some(tray) = app.tray_by_id("token-tray") else {
+        return Ok(false);
+    };
+    let Some(tray_rect) = tray.rect().ok().flatten() else {
+        return Ok(false);
+    };
+
+    let tray_position = tray_rect.position.to_physical::<i32>(1.0);
+    let tray_size = tray_rect.size.to_physical::<u32>(1.0);
+    let details_size = details.outer_size().map_err(|error| error.to_string())?;
+    let monitor = app
+        .monitor_from_point(
+            f64::from(tray_position.x) + f64::from(tray_size.width) / 2.0,
+            f64::from(tray_position.y) + f64::from(tray_size.height) / 2.0,
+        )
+        .ok()
+        .flatten()
+        .or_else(|| details.current_monitor().ok().flatten());
+    let position = position_below_anchor(
+        tray_position,
+        tray_size,
+        details_size,
+        monitor.as_ref().map(|monitor| monitor.work_area()),
+    );
+
+    details
+        .set_position(position)
+        .map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -171,7 +246,7 @@ fn toggle_details_window(app: tauri::AppHandle) -> Result<(), String> {
         .ok_or_else(|| "找不到详情窗口".to_string())?;
 
     if details.is_visible().unwrap_or(false) {
-        details.hide().map_err(|error| error.to_string())
+        request_hide_details_window(app)
     } else {
         show_details_window(app)
     }
@@ -179,10 +254,65 @@ fn toggle_details_window(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(details) = app.get_webview_window("details") {
-        details.hide().map_err(|error| error.to_string())?;
+    request_hide_details_window(app)
+}
+
+fn request_hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(details) = app.get_webview_window("details") else {
+        return Ok(());
+    };
+    if !details.is_visible().unwrap_or(false) {
+        return Ok(());
     }
+
+    let animation_state = app.state::<DetailsWindowState>().inner().clone();
+    let generation = animation_state.next_generation();
+    let _ = app.emit_to("details", "details-window-closing", ());
+
+    let app_for_main_thread = app.clone();
+    let app_for_lookup = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(DETAILS_ANIMATION_DURATION_MS));
+        let _ = app_for_main_thread.run_on_main_thread(move || {
+            if !animation_state.is_current(generation) {
+                return;
+            }
+            if let Some(details) = app_for_lookup.get_webview_window("details") {
+                let _ = details.hide();
+            }
+        });
+    });
+
     Ok(())
+}
+
+fn position_below_anchor(
+    anchor_position: tauri::PhysicalPosition<i32>,
+    anchor_size: tauri::PhysicalSize<u32>,
+    details_size: tauri::PhysicalSize<u32>,
+    work_area: Option<&tauri::PhysicalRect<i32, u32>>,
+) -> tauri::PhysicalPosition<i32> {
+    const GAP: i32 = 10;
+
+    let width = details_size.width.max(1) as i32;
+    let height = details_size.height.max(1) as i32;
+    let anchor_width = anchor_size.width as i32;
+    let anchor_height = anchor_size.height as i32;
+    let mut x = anchor_position.x + (anchor_width - width) / 2;
+    let mut y = anchor_position.y + anchor_height + GAP;
+
+    if let Some(work_area) = work_area {
+        let left = work_area.position.x;
+        let top = work_area.position.y;
+        let right = left.saturating_add(work_area.size.width as i32);
+        let bottom = top.saturating_add(work_area.size.height as i32);
+        let max_x = (right - width).max(left);
+        let max_y = (bottom - height).max(top);
+        x = x.max(left).min(max_x);
+        y = y.max(top).min(max_y);
+    }
+
+    tauri::PhysicalPosition::new(x, y)
 }
 
 fn position_details_window(
@@ -413,6 +543,26 @@ mod tests {
     fn clamps_normal_taskbar_range() {
         assert_eq!(clamp_position(5, 10, 20), 10);
         assert_eq!(clamp_position(25, 10, 20), 20);
+    }
+}
+
+#[cfg(test)]
+mod details_position_tests {
+    use super::position_below_anchor;
+
+    #[test]
+    fn positions_details_below_tray_and_inside_work_area() {
+        let position = position_below_anchor(
+            tauri::PhysicalPosition::new(100, 0),
+            tauri::PhysicalSize::new(40, 24),
+            tauri::PhysicalSize::new(380, 480),
+            Some(&tauri::PhysicalRect {
+                position: tauri::PhysicalPosition::new(0, 0),
+                size: tauri::PhysicalSize::new(1440, 900),
+            }),
+        );
+
+        assert_eq!(position, tauri::PhysicalPosition::new(0, 34));
     }
 }
 

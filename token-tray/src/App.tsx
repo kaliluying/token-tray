@@ -70,7 +70,7 @@ type RelayUsageSnapshot = {
   error: string | null;
 };
 
-type StatsMode = "ccswitch" | "photonmark";
+type StatsMode = "local" | "photonmark";
 
 type UsageUpdate = {
   snapshot: UsageSnapshot;
@@ -90,6 +90,8 @@ type DetailsPanelProps = {
   onRefreshRelayUsage: () => Promise<void>;
   onOpenRelayConfig: () => Promise<void>;
 };
+
+type DetailsAnimationPhase = "idle" | "opening" | "closing";
 
 const currentAppWindow = getCurrentWindow();
 const currentWindowLabel = currentAppWindow.label;
@@ -330,8 +332,10 @@ function DetailsPanel({
   onRefreshRelayUsage,
   onOpenRelayConfig,
 }: DetailsPanelProps) {
-  const [statsMode, setStatsMode] = useState<StatsMode>("ccswitch");
+  const [statsMode, setStatsMode] = useState<StatsMode>("local");
   const { today } = snapshot;
+  const [animationPhase, setAnimationPhase] = useState<DetailsAnimationPhase>("idle");
+  const animationFrameRef = useRef<number | null>(null);
   const overview = [
     { label: "近 7 天", value: snapshot.lastSevenDays.totalTokens },
     { label: "本月", value: snapshot.month.totalTokens },
@@ -354,12 +358,58 @@ function DetailsPanel({
     { totalTokens: 0, requests: 0, amountUsd: 0, hasData: false, hasAmount: false },
   );
 
+  const playAnimation = useCallback((phase: Exclude<DetailsAnimationPhase, "idle">) => {
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+    setAnimationPhase("idle");
+    animationFrameRef.current = requestAnimationFrame(() => {
+      animationFrameRef.current = null;
+      setAnimationPhase(phase);
+    });
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenOpening: (() => void) | undefined;
+    let unlistenClosing: (() => void) | undefined;
+    let unlistenFocus: (() => void) | undefined;
+
+    const setup = async () => {
+      const [opening, closing, focus] = await Promise.all([
+        listen("details-window-opening", () => playAnimation("opening")),
+        listen("details-window-closing", () => playAnimation("closing")),
+        currentAppWindow.onFocusChanged(({ payload }) => playAnimation(payload ? "opening" : "closing")),
+      ]);
+      if (disposed) {
+        opening();
+        closing();
+        focus();
+        return;
+      }
+      unlistenOpening = opening;
+      unlistenClosing = closing;
+      unlistenFocus = focus;
+    };
+    void setup();
+
+    return () => {
+      disposed = true;
+      unlistenOpening?.();
+      unlistenClosing?.();
+      unlistenFocus?.();
+      if (animationFrameRef.current !== null) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, [playAnimation]);
+
   return (
-    <main className="details-page">
+    <main className={`details-page${animationPhase === "idle" ? "" : ` is-${animationPhase}`}`}>
       <header className="details-header">
         <div>
-          <span className="details-kicker">Token 统计</span>
-          <h1>{statsMode === "ccswitch" ? "今日用量" : "中转站用量"}</h1>
+          <span className="details-kicker">{statsMode === "local" ? "本地日志估算" : "Token 统计"}</span>
+          <h1>{statsMode === "local" ? "今日用量" : "中转站用量"}</h1>
         </div>
         <button className="close-button" type="button" onClick={() => void invoke("hide_details_window")} aria-label="关闭详情面板">
           ×
@@ -368,13 +418,13 @@ function DetailsPanel({
 
       <div className="stats-mode-switch" role="tablist" aria-label="统计来源">
         <button
-          className={statsMode === "ccswitch" ? "is-active" : ""}
+          className={statsMode === "local" ? "is-active" : ""}
           type="button"
           role="tab"
-          aria-selected={statsMode === "ccswitch"}
-          onClick={() => setStatsMode("ccswitch")}
+          aria-selected={statsMode === "local"}
+          onClick={() => setStatsMode("local")}
         >
-          CC Switch
+          本地统计
         </button>
         <button
           className={statsMode === "photonmark" ? "is-active" : ""}
@@ -387,7 +437,7 @@ function DetailsPanel({
         </button>
       </div>
 
-      {statsMode === "ccswitch" && <section className="details-hero">
+      {statsMode === "local" && <section className="details-hero">
         <div className="details-total">
           <strong>{formatTokens(today.totalTokens)}</strong>
           <span className="token-approximation">{formatTokenApproximation(today.totalTokens)}</span>
@@ -396,7 +446,7 @@ function DetailsPanel({
         <p>{today.requests.toLocaleString("en-US")} 次请求</p>
       </section>}
 
-      {statsMode === "ccswitch" && <section className="balance-card" aria-label="余额" aria-live="polite">
+      {statsMode === "local" && <section className="balance-card" aria-label="余额" aria-live="polite">
         <div className="balance-card-heading">
           <div>
             <span className="balance-kicker">余额</span>
@@ -514,7 +564,7 @@ function DetailsPanel({
         </p>
       </section>}
 
-      {statsMode === "ccswitch" && <section className="overview-grid" aria-label="用量概览">
+      {statsMode === "local" && <section className="overview-grid" aria-label="用量概览">
         {overview.map((item) => (
           <div className="overview-card" key={item.label}>
             <span>{item.label}</span>
@@ -523,7 +573,7 @@ function DetailsPanel({
         ))}
       </section>}
 
-      {statsMode === "ccswitch" && <section className="details-section trend-section">
+      {statsMode === "local" && <section className="details-section trend-section">
         <div className="section-heading">
           <h2>近七天趋势</h2>
           <span>{formatTokens(snapshot.lastSevenDays.totalTokens)} tokens · {formatTokenApproximation(snapshot.lastSevenDays.totalTokens)}</span>
@@ -531,7 +581,7 @@ function DetailsPanel({
         <UsageTrendChart points={snapshot.daily} />
       </section>}
 
-      {statsMode === "ccswitch" && <section className="details-section">
+      {statsMode === "local" && <section className="details-section">
         <div className="section-heading">
           <h2>今日明细</h2>
           <span>{today.requests.toLocaleString("en-US")} 次请求</span>

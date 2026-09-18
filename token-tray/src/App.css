@@ -57,6 +57,25 @@ button { font: inherit; }
   border-radius: 22px;
   box-shadow: inset 0 1px 1px rgba(255, 255, 255, .88);
   clip-path: inset(0 round 22px);
+  transform-origin: top center;
+  will-change: transform, opacity;
+}
+
+.details-page.is-opening { animation: details-pop-in 220ms cubic-bezier(.16, 1, .3, 1) both; }
+.details-page.is-closing { animation: details-pop-out 180ms cubic-bezier(.4, 0, 1, 1) both; pointer-events: none; }
+
+@keyframes details-pop-in {
+  from { opacity: 0; transform: translateY(-6px) scale(.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes details-pop-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(-6px) scale(.97); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .details-page.is-opening, .details-page.is-closing { animation-duration: 1ms; }
 }
 
 .details-page::-webkit-scrollbar { display: none; width: 0; height: 0; }

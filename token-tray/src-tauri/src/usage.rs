@@ -1,27 +1,22 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OpenFlags};
 use serde::Serialize;
+use serde_json::Value;
 use tauri::tray::TrayIcon;
 use tauri::{AppHandle, Emitter, Runtime, State};
 use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, UtcOffset};
+use time::{Duration as TimeDuration, OffsetDateTime, UtcOffset};
 
 use crate::diagnostics;
 
-const DATABASE_ENV: &str = "CC_SWITCH_DB_PATH";
-const DATABASE_FILENAMES: &[&str] = &[
-    "cc-switch.db",
-    "cc-switch.sqlite",
-    "cc-switch.sqlite3",
-    "database.db",
-    "database.sqlite",
-];
+const CLAUDE_CONFIG_ENV: &str = "CLAUDE_CONFIG_DIR";
+const CODEX_HOME_ENV: &str = "CODEX_HOME";
 
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,30 +69,30 @@ pub struct UsageUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStatus {
     Success,
-    DatabaseNotFound,
-    DatabaseUnavailable,
-    UnsupportedSchema,
-    QueryFailed,
+    LocalFilesNotFound,
+    LocalFilesUnavailable,
+    UnsupportedFormat,
+    ReadFailed,
 }
 
 impl SyncStatus {
     pub fn user_message(self) -> &'static str {
         match self {
             Self::Success => "",
-            Self::DatabaseNotFound => "未找到 CC Switch 数据库",
-            Self::DatabaseUnavailable => "暂时无法读取 CC Switch 数据库",
-            Self::UnsupportedSchema => "CC Switch 数据库结构暂不兼容",
-            Self::QueryFailed => "读取 CC Switch 统计失败",
+            Self::LocalFilesNotFound => "未找到本地会话文件",
+            Self::LocalFilesUnavailable => "暂时无法读取本地会话文件",
+            Self::UnsupportedFormat => "本地会话文件格式暂不兼容",
+            Self::ReadFailed => "读取本地 Token 统计失败",
         }
     }
 
     pub fn diagnostic_result(self) -> &'static str {
         match self {
             Self::Success => "success",
-            Self::DatabaseNotFound => "database_not_found",
-            Self::DatabaseUnavailable => "database_unavailable",
-            Self::UnsupportedSchema => "unsupported_schema",
-            Self::QueryFailed => "query_failed",
+            Self::LocalFilesNotFound => "local_files_not_found",
+            Self::LocalFilesUnavailable => "local_files_unavailable",
+            Self::UnsupportedFormat => "unsupported_format",
+            Self::ReadFailed => "read_failed",
         }
     }
 }
@@ -116,7 +111,7 @@ pub struct UsageStore {
 struct UsageStoreInner {
     cache: Mutex<UsageCache>,
     sync_lock: Mutex<()>,
-    database_path: Mutex<Option<PathBuf>>,
+    file_cache: Mutex<HashMap<PathBuf, CachedFile>>,
 }
 
 #[derive(Default)]
@@ -124,6 +119,27 @@ struct UsageCache {
     snapshot: UsageSnapshot,
     last_synced_at: Option<i64>,
     error: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedFile {
+    signature: FileSignature,
+    rows: Vec<DailyAppRow>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileSignature {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileSignature {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
 }
 
 impl UsageStore {
@@ -146,34 +162,72 @@ impl UsageStore {
             .sync_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cached_path = self
+        let source_files = discover_source_files();
+        let source_file_count = source_files.len();
+        let mut cached_files = self
             .inner
-            .database_path
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-
-        let result = match cached_path.as_deref() {
-            Some(path) => match read_snapshot(path) {
-                Ok(snapshot) => Ok((snapshot, path.to_path_buf())),
-                Err(_) => discover_and_read(),
-            },
-            None => discover_and_read(),
-        };
-
-        let (status, snapshot, path) = match result {
-            Ok((snapshot, path)) => (SyncStatus::Success, Some(snapshot), Some(path)),
-            Err(status) => (status, None, None),
-        };
-
-        let mut database_path = self
-            .inner
-            .database_path
+            .file_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *database_path = path;
-        drop(database_path);
+        let mut next_cache = HashMap::with_capacity(source_files.len());
+        let mut accumulator = UsageAccumulator::default();
+        let mut readable_files = 0;
+        let mut saw_unavailable = false;
+        let mut saw_unsupported = false;
 
+        for source in source_files {
+            let metadata = match fs::metadata(&source.path) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(_) => {
+                    saw_unavailable = true;
+                    continue;
+                }
+            };
+            let signature = FileSignature::from_metadata(&metadata);
+            let rows = match cached_files.remove(&source.path) {
+                Some(cached) if cached.signature == signature => Some(cached.rows),
+                _ => match read_source_file(&source) {
+                    Ok(rows) => Some(rows),
+                    Err(SyncStatus::UnsupportedFormat) => {
+                        saw_unsupported = true;
+                        None
+                    }
+                    Err(_) => {
+                        saw_unavailable = true;
+                        None
+                    }
+                },
+            };
+
+            let Some(rows) = rows else {
+                continue;
+            };
+            readable_files += 1;
+            for row in &rows {
+                accumulator.add(row);
+            }
+            next_cache.insert(source.path, CachedFile { signature, rows });
+        }
+        *cached_files = next_cache;
+        drop(cached_files);
+
+        let result = if readable_files > 0 {
+            Ok(accumulator.finish())
+        } else if source_file_count == 0 {
+            Err(SyncStatus::LocalFilesNotFound)
+        } else if saw_unsupported {
+            Err(SyncStatus::UnsupportedFormat)
+        } else if saw_unavailable {
+            Err(SyncStatus::LocalFilesUnavailable)
+        } else {
+            Err(SyncStatus::ReadFailed)
+        };
+
+        let (status, snapshot) = match result {
+            Ok(snapshot) => (SyncStatus::Success, Some(snapshot)),
+            Err(status) => (status, None),
+        };
         let mut cache = self
             .inner
             .cache
@@ -314,103 +368,95 @@ pub fn format_tokens(value: i64) -> String {
     formatted
 }
 
-fn discover_and_read() -> Result<(UsageSnapshot, PathBuf), SyncStatus> {
-    let mut saw_file = false;
-    let mut saw_unsupported = false;
-    for path in database_candidates() {
-        if !path.is_file() {
-            continue;
-        }
-        saw_file = true;
-        match read_snapshot(&path) {
-            Ok(snapshot) => return Ok((snapshot, path)),
-            Err(SyncStatus::UnsupportedSchema) => saw_unsupported = true,
-            Err(_) => {}
-        }
-    }
-
-    if saw_unsupported {
-        Err(SyncStatus::UnsupportedSchema)
-    } else if saw_file {
-        Err(SyncStatus::DatabaseUnavailable)
-    } else {
-        Err(SyncStatus::DatabaseNotFound)
-    }
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Claude,
+    Codex,
 }
 
-fn read_snapshot(path: &Path) -> Result<UsageSnapshot, SyncStatus> {
-    let connection = open_database(path)?;
-    let mut snapshot = query_snapshot(&connection)?;
-    snapshot.source = "CC Switch".to_string();
-    Ok(snapshot)
+struct SourceFile {
+    path: PathBuf,
+    kind: SourceKind,
 }
 
-fn open_database(path: &Path) -> Result<Connection, SyncStatus> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|_| SyncStatus::DatabaseUnavailable)?;
-    connection
-        .busy_timeout(Duration::from_millis(750))
-        .map_err(|_| SyncStatus::DatabaseUnavailable)?;
-    Ok(connection)
-}
-
-fn database_candidates() -> Vec<PathBuf> {
-    if let Some(path) = env::var_os(DATABASE_ENV).filter(|value| !value.is_empty()) {
-        return vec![PathBuf::from(path)];
-    }
-
-    let mut roots = Vec::new();
-    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
-        let home = PathBuf::from(home);
-        roots.push(home.clone());
-        roots.push(home.join(".config"));
-        roots.push(home.join(".local").join("share"));
-        roots.push(home.join("Library").join("Application Support"));
-    }
-    for variable in [
-        "APPDATA",
-        "LOCALAPPDATA",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-    ] {
-        if let Some(path) = env::var_os(variable) {
-            roots.push(PathBuf::from(path));
-        }
-    }
-
-    let mut candidates = Vec::new();
+fn discover_source_files() -> Vec<SourceFile> {
+    let mut files = Vec::new();
     let mut seen = HashSet::new();
-    for root in roots {
-        add_database_paths(&root, &mut candidates, &mut seen);
-        for directory in [".cc-switch", "cc-switch", "CC Switch", "CCSwitch"] {
-            let directory = root.join(directory);
-            add_database_paths(&directory, &mut candidates, &mut seen);
-            add_database_paths(&directory.join("data"), &mut candidates, &mut seen);
-            add_database_paths(&directory.join("database"), &mut candidates, &mut seen);
-        }
-        scan_for_cc_switch_directories(&root, 0, &mut candidates, &mut seen);
+    for root in claude_roots() {
+        collect_jsonl_files(
+            &claude_projects_root(&root),
+            SourceKind::Claude,
+            &mut files,
+            &mut seen,
+        );
     }
-    candidates
+    if let Some(root) = source_root(CODEX_HOME_ENV, ".codex") {
+        collect_jsonl_files(
+            &root.join("sessions"),
+            SourceKind::Codex,
+            &mut files,
+            &mut seen,
+        );
+        collect_jsonl_files(
+            &root.join("archived_sessions"),
+            SourceKind::Codex,
+            &mut files,
+            &mut seen,
+        );
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files
 }
 
-fn add_database_paths(directory: &Path, output: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>) {
-    for filename in DATABASE_FILENAMES {
-        let path = directory.join(filename);
-        if seen.insert(path.clone()) {
-            output.push(path);
-        }
+fn claude_projects_root(root: &Path) -> PathBuf {
+    if root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("projects"))
+    {
+        root.to_path_buf()
+    } else {
+        root.join("projects")
     }
 }
 
-fn scan_for_cc_switch_directories(
+fn claude_roots() -> Vec<PathBuf> {
+    if let Some(value) = env::var_os(CLAUDE_CONFIG_ENV).filter(|value| !value.is_empty()) {
+        return value
+            .to_string_lossy()
+            .split(',')
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect();
+    }
+
+    let Some(home) = home_directory() else {
+        return Vec::new();
+    };
+    vec![home.join(".claude"), home.join(".config").join("claude")]
+}
+
+fn source_root(variable: &str, default_directory: &str) -> Option<PathBuf> {
+    if let Some(path) = env::var_os(variable).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    home_directory().map(|home| home.join(default_directory))
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn collect_jsonl_files(
     directory: &Path,
-    depth: u8,
-    output: &mut Vec<PathBuf>,
+    kind: SourceKind,
+    output: &mut Vec<SourceFile>,
     seen: &mut HashSet<PathBuf>,
 ) {
-    if depth > 2 {
-        return;
-    }
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -419,434 +465,423 @@ fn scan_for_cc_switch_directories(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if !file_type.is_dir() {
+        if file_type.is_dir() {
+            collect_jsonl_files(&path, kind, output, seen);
+        } else if file_type.is_file()
+            && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            && seen.insert(path.clone())
+        {
+            output.push(SourceFile { path, kind });
+        }
+    }
+}
+
+fn read_source_file(source: &SourceFile) -> Result<Vec<DailyAppRow>, SyncStatus> {
+    let file = File::open(&source.path).map_err(|_| SyncStatus::LocalFilesUnavailable)?;
+    let reader = BufReader::new(file);
+    let mut rows = Vec::new();
+    let mut claude_records = HashMap::<String, DailyAppRow>::new();
+    let mut previous_codex_total = None;
+    let mut saw_valid_json = false;
+
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|_| SyncStatus::LocalFilesUnavailable)?;
+        if line.trim().is_empty() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if name == "cc-switch" || name == "cc switch" || name == "ccswitch" {
-            add_database_paths(&path, output, seen);
-            add_database_paths(&path.join("data"), output, seen);
-            add_database_paths(&path.join("database"), output, seen);
-        } else if depth < 2 {
-            scan_for_cc_switch_directories(&path, depth + 1, output, seen);
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            // The final line may be incomplete while the client is appending it.
+            continue;
+        };
+        saw_valid_json = true;
+        let parsed = match source.kind {
+            SourceKind::Claude => {
+                let fallback = format!("{}:{line_number}", source.path.display());
+                parse_claude_record(&value, &fallback)
+            }
+            SourceKind::Codex => parse_codex_record(&value, &mut previous_codex_total),
+        };
+        let Some(row) = parsed else {
+            continue;
+        };
+        if let Some(identity) = row.identity.clone() {
+            if let Some(existing) = claude_records.get_mut(&identity) {
+                merge_claude_rows(existing, row);
+            } else {
+                claude_records.insert(identity, row);
+            }
+        } else {
+            rows.push(row);
+        }
+    }
+
+    if !saw_valid_json {
+        return Err(SyncStatus::UnsupportedFormat);
+    }
+    rows.extend(claude_records.into_values());
+    Ok(rows)
+}
+
+fn parse_claude_record(value: &Value, fallback_identity: &str) -> Option<DailyAppRow> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let message = value.get("message")?.as_object()?;
+    let usage = message.get("usage")?.as_object()?;
+    let date = date_from_value(value)?;
+    let message_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let request_id = value
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let session_id = value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let identity = if message_id.is_empty() && request_id.is_empty() {
+        fallback_identity.to_string()
+    } else {
+        format!("{session_id}\u{1f}{message_id}\u{1f}{request_id}")
+    };
+    let input_tokens = object_number(usage, &["input_tokens"]);
+    let output_tokens = object_number(usage, &["output_tokens"]);
+    let cache_read_tokens = object_number(usage, &["cache_read_input_tokens", "cache_read_tokens"]);
+    let cache_creation_tokens = object_number(usage, &["cache_creation_input_tokens"])
+        .max(nested_cache_creation_tokens(usage.get("cache_creation")));
+    let total_tokens = sum_tokens(
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    );
+    Some(DailyAppRow {
+        date,
+        app_type: "claude".to_string(),
+        totals: TokenTotals {
+            requests: 1,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            total_tokens,
+        },
+        identity: Some(identity),
+    })
+}
+
+fn parse_codex_record(
+    value: &Value,
+    previous_total: &mut Option<RawTokenUsage>,
+) -> Option<DailyAppRow> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return None;
+    }
+    let info = payload.get("info")?.as_object()?;
+    let cumulative = info.get("total_token_usage").map(RawTokenUsage::from_value);
+    let raw = if let Some(last) = info.get("last_token_usage") {
+        if let Some(cumulative) = cumulative {
+            *previous_total = Some(cumulative);
+        }
+        RawTokenUsage::from_value(last)
+    } else {
+        let cumulative = cumulative?;
+        let delta = previous_total
+            .map(|previous| cumulative.saturating_sub(previous))
+            .unwrap_or(cumulative);
+        *previous_total = Some(cumulative);
+        delta
+    };
+    Some(DailyAppRow {
+        date: date_from_value(value)?,
+        app_type: "codex".to_string(),
+        totals: raw.into_totals(),
+        identity: None,
+    })
+}
+
+fn merge_claude_rows(target: &mut DailyAppRow, source: DailyAppRow) {
+    if source.date < target.date {
+        target.date = source.date;
+    }
+    target.totals.input_tokens = target.totals.input_tokens.max(source.totals.input_tokens);
+    target.totals.output_tokens = target.totals.output_tokens.max(source.totals.output_tokens);
+    target.totals.cache_read_tokens = target
+        .totals
+        .cache_read_tokens
+        .max(source.totals.cache_read_tokens);
+    target.totals.cache_creation_tokens = target
+        .totals
+        .cache_creation_tokens
+        .max(source.totals.cache_creation_tokens);
+    target.totals.requests = 1;
+    target.totals.total_tokens = sum_tokens(
+        target.totals.input_tokens,
+        target.totals.output_tokens,
+        target.totals.cache_read_tokens,
+        target.totals.cache_creation_tokens,
+    );
+}
+
+#[derive(Clone, Copy, Default)]
+struct RawTokenUsage {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+}
+
+impl RawTokenUsage {
+    fn from_value(value: &Value) -> Self {
+        let Some(object) = value.as_object() else {
+            return Self::default();
+        };
+        Self {
+            input_tokens: object_number(object, &["input_tokens"]),
+            cached_input_tokens: object_number(
+                object,
+                &["cached_input_tokens", "cache_read_input_tokens"],
+            ),
+            cache_write_input_tokens: object_number(
+                object,
+                &["cache_write_input_tokens", "cache_creation_input_tokens"],
+            ),
+            output_tokens: object_number(object, &["output_tokens"]),
+        }
+    }
+
+    fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_sub(other.input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(other.cached_input_tokens),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .saturating_sub(other.cache_write_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(other.output_tokens),
+        }
+    }
+
+    fn into_totals(self) -> TokenTotals {
+        let input_tokens = self.input_tokens.saturating_sub(
+            self.cached_input_tokens
+                .saturating_add(self.cache_write_input_tokens),
+        );
+        TokenTotals {
+            requests: 1,
+            input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cached_input_tokens,
+            cache_creation_tokens: self.cache_write_input_tokens,
+            total_tokens: sum_tokens(
+                input_tokens,
+                self.output_tokens,
+                self.cached_input_tokens,
+                self.cache_write_input_tokens,
+            ),
+        }
+    }
+}
+
+fn date_from_value(value: &Value) -> Option<String> {
+    let timestamp = value.get("timestamp")?;
+    if let Some(timestamp) = timestamp.as_str() {
+        let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+        if let Ok(value) = OffsetDateTime::parse(timestamp, &Rfc3339) {
+            return Some(format_date(value.to_offset(offset).date()));
+        }
+        let date = timestamp.get(..10)?;
+        if date.as_bytes().get(4) == Some(&b'-') && date.as_bytes().get(7) == Some(&b'-') {
+            return Some(date.to_string());
+        }
+    }
+
+    let timestamp = timestamp.as_i64().or_else(|| {
+        timestamp
+            .as_u64()
+            .and_then(|value| i64::try_from(value).ok())
+    })?;
+    let seconds = if timestamp > 100_000_000_000 {
+        timestamp / 1_000
+    } else {
+        timestamp
+    };
+    let value = OffsetDateTime::from_unix_timestamp(seconds).ok()?;
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    Some(format_date(value.to_offset(offset).date()))
+}
+
+fn object_number(object: &serde_json::Map<String, Value>, names: &[&str]) -> i64 {
+    names
+        .iter()
+        .find_map(|name| value_as_i64(object.get(*name)))
+        .unwrap_or_default()
+}
+
+fn value_as_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    if let Some(value) = value.as_i64() {
+        return Some(value.max(0));
+    }
+    if let Some(value) = value.as_u64() {
+        return Some(value.min(i64::MAX as u64) as i64);
+    }
+    value
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value.min(i64::MAX as f64) as i64)
+        .or_else(|| {
+            value
+                .as_str()?
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|value| value.max(0))
+        })
+}
+
+fn nested_cache_creation_tokens(value: Option<&Value>) -> i64 {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return 0;
+    };
+    object_number(object, &["ephemeral_5m_input_tokens"])
+        .saturating_add(object_number(object, &["ephemeral_1h_input_tokens"]))
+        .saturating_add(object_number(object, &["input_tokens"]))
+}
+
+fn sum_tokens(input: i64, output: i64, cache_read: i64, cache_creation: i64) -> i64 {
+    input
+        .saturating_add(output)
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation)
+}
+
+#[derive(Default)]
+struct UsageAccumulator {
+    direct_rows: BTreeMap<(String, String), TokenTotals>,
+    claude_records: HashMap<String, DailyAppRow>,
+}
+
+impl UsageAccumulator {
+    fn add(&mut self, row: &DailyAppRow) {
+        if let Some(identity) = row.identity.clone() {
+            if let Some(existing) = self.claude_records.get_mut(&identity) {
+                merge_claude_rows(existing, row.clone());
+            } else {
+                self.claude_records.insert(identity, row.clone());
+            }
+            return;
+        }
+        add_totals(
+            self.direct_rows
+                .entry((row.date.clone(), row.app_type.clone()))
+                .or_default(),
+            &row.totals,
+        );
+    }
+
+    fn finish(self) -> UsageSnapshot {
+        let mut rows = self.direct_rows;
+        for row in self.claude_records.into_values() {
+            add_totals(
+                rows.entry((row.date, row.app_type)).or_default(),
+                &row.totals,
+            );
+        }
+        let (today_key, month_key, seven_days_key, dates) = local_date_keys();
+        let mut today = TokenTotals::default();
+        let mut month = TokenTotals::default();
+        let mut last_seven_days = TokenTotals::default();
+        let mut total = TokenTotals::default();
+        let mut by_date = BTreeMap::<String, TokenTotals>::new();
+        let mut by_app = BTreeMap::<String, TokenTotals>::new();
+        for ((date, app_type), totals) in rows {
+            add_totals(&mut total, &totals);
+            add_totals(by_date.entry(date).or_default(), &totals);
+            add_totals(by_app.entry(app_type).or_default(), &totals);
+        }
+        for (date, totals) in &by_date {
+            if date >= &month_key {
+                add_totals(&mut month, totals);
+            }
+            if date >= &seven_days_key {
+                add_totals(&mut last_seven_days, totals);
+            }
+            if date == &today_key {
+                add_totals(&mut today, totals);
+            }
+        }
+
+        let daily = dates
+            .into_iter()
+            .map(|date| {
+                let totals = by_date.get(&date).cloned().unwrap_or_default();
+                DailyUsage {
+                    date,
+                    total_tokens: totals.total_tokens,
+                    requests: totals.requests,
+                }
+            })
+            .collect();
+        let mut by_app = by_app
+            .into_iter()
+            .map(|(app_type, totals)| AppUsage {
+                app_type,
+                total_tokens: totals.total_tokens,
+                requests: totals.requests,
+            })
+            .collect::<Vec<_>>();
+        by_app.sort_by(|left, right| right.total_tokens.cmp(&left.total_tokens));
+
+        UsageSnapshot {
+            today,
+            month,
+            total,
+            last_seven_days,
+            daily,
+            by_app,
+            updated_at: today_key,
+            source: "本地会话文件".to_string(),
         }
     }
 }
 
 #[derive(Clone)]
-struct TableInfo {
-    name: String,
-    columns: HashMap<String, String>,
-}
-
-#[derive(Clone, Copy)]
-enum TableKind {
-    Rollup,
-    Log,
-}
-
-fn query_snapshot(connection: &Connection) -> Result<UsageSnapshot, SyncStatus> {
-    let tables = table_infos(connection)?;
-    let mut fragments = Vec::new();
-    for table in tables {
-        let Some(kind) = table_kind(&table.name) else {
-            continue;
-        };
-        let fragment = match kind {
-            TableKind::Rollup => build_rollup_fragment(&table),
-            TableKind::Log => build_log_fragment(&table),
-        };
-        if let Some(fragment) = fragment {
-            fragments.push(fragment);
-        }
-    }
-    if fragments.is_empty() {
-        return Err(SyncStatus::UnsupportedSchema);
-    }
-
-    let rows_sql = format!(
-        "SELECT date_key, app_type, requests, input_tokens, output_tokens, \
-                cache_read_tokens, cache_creation_tokens, total_tokens \
-           FROM ({}) \
-          ORDER BY date_key DESC",
-        fragments.join(" UNION ALL ")
-    );
-    let mut statement = connection
-        .prepare(&rows_sql)
-        .map_err(|_| SyncStatus::QueryFailed)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(DailyAppRow {
-                date: row.get(0)?,
-                app_type: row.get(1)?,
-                totals: TokenTotals {
-                    requests: row.get(2)?,
-                    input_tokens: row.get(3)?,
-                    output_tokens: row.get(4)?,
-                    cache_read_tokens: row.get(5)?,
-                    cache_creation_tokens: row.get(6)?,
-                    total_tokens: row.get(7)?,
-                },
-            })
-        })
-        .map_err(|_| SyncStatus::QueryFailed)?;
-
-    let today_key = today_key(connection)?;
-    let seven_days_key = connection
-        .query_row("SELECT date('now', 'localtime', '-6 days')", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|_| SyncStatus::QueryFailed)?;
-    let month_key = today_key.get(..7).unwrap_or(today_key.as_str()).to_string();
-    let mut today = TokenTotals::default();
-    let mut month = TokenTotals::default();
-    let mut total = TokenTotals::default();
-    let mut last_seven_days = TokenTotals::default();
-    let mut daily_by_date = BTreeMap::<String, TokenTotals>::new();
-    let mut by_app = BTreeMap::<String, TokenTotals>::new();
-    for row in rows {
-        let row = row.map_err(|_| SyncStatus::QueryFailed)?;
-        add_totals(&mut total, &row.totals);
-        if row.date >= month_key {
-            add_totals(&mut month, &row.totals);
-        }
-        if row.date >= seven_days_key {
-            add_totals(&mut last_seven_days, &row.totals);
-            let date_totals = daily_by_date.entry(row.date.clone()).or_default();
-            add_totals(date_totals, &row.totals);
-        }
-        let app_totals = by_app.entry(row.app_type).or_default();
-        add_totals(app_totals, &row.totals);
-        if row.date == today_key {
-            add_totals(&mut today, &row.totals);
-        }
-    }
-
-    let mut by_app = by_app
-        .into_iter()
-        .map(|(app_type, totals)| AppUsage {
-            app_type,
-            total_tokens: totals.total_tokens,
-            requests: totals.requests,
-        })
-        .collect::<Vec<_>>();
-    by_app.sort_by(|left, right| right.total_tokens.cmp(&left.total_tokens));
-
-    let mut date_statement = connection
-        .prepare(
-            "WITH RECURSIVE days(date_key) AS (
-                SELECT ?1
-                UNION ALL
-                SELECT date(date_key, '+1 day')
-                  FROM days
-                 WHERE date_key < ?2
-            )
-            SELECT date_key FROM days ORDER BY date_key",
-        )
-        .map_err(|_| SyncStatus::QueryFailed)?;
-    let dates = date_statement
-        .query_map(params![&seven_days_key, &today_key], |row| {
-            row.get::<_, String>(0)
-        })
-        .map_err(|_| SyncStatus::QueryFailed)?;
-    let mut daily = Vec::new();
-    for date in dates {
-        let date = date.map_err(|_| SyncStatus::QueryFailed)?;
-        let totals = daily_by_date.remove(&date).unwrap_or_default();
-        daily.push(DailyUsage {
-            date,
-            total_tokens: totals.total_tokens,
-            requests: totals.requests,
-        });
-    }
-
-    Ok(UsageSnapshot {
-        today,
-        month,
-        total,
-        last_seven_days,
-        daily,
-        by_app,
-        updated_at: today_key,
-        source: String::new(),
-    })
-}
-
 struct DailyAppRow {
     date: String,
     app_type: String,
     totals: TokenTotals,
+    identity: Option<String>,
 }
 
-fn table_infos(connection: &Connection) -> Result<Vec<TableInfo>, SyncStatus> {
-    let mut statement = connection
-        .prepare(
-            "SELECT name FROM sqlite_master \
-               WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        )
-        .map_err(|_| SyncStatus::QueryFailed)?;
-    let table_names = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|_| SyncStatus::QueryFailed)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| SyncStatus::QueryFailed)?;
-
-    let mut tables = Vec::new();
-    for name in table_names {
-        let pragma = format!("PRAGMA table_info({})", quote_identifier(&name));
-        let mut columns_statement = connection
-            .prepare(&pragma)
-            .map_err(|_| SyncStatus::QueryFailed)?;
-        let columns = columns_statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|_| SyncStatus::QueryFailed)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| SyncStatus::QueryFailed)?
-            .into_iter()
-            .map(|column| (column.to_ascii_lowercase(), column))
-            .collect::<HashMap<_, _>>();
-        tables.push(TableInfo { name, columns });
-    }
-    Ok(tables)
+fn local_date_keys() -> (String, String, String, Vec<String>) {
+    let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let today = OffsetDateTime::now_utc().to_offset(offset).date();
+    let today_key = format_date(today);
+    let month_key = today_key[..7].to_string();
+    let seven_days_ago = today.saturating_sub(TimeDuration::days(6));
+    let seven_days_key = format_date(seven_days_ago);
+    let dates = (0..=6)
+        .rev()
+        .map(|days_ago| format_date(today.saturating_sub(TimeDuration::days(days_ago))))
+        .collect();
+    (today_key, month_key, seven_days_key, dates)
 }
 
-fn table_kind(name: &str) -> Option<TableKind> {
-    let normalized = name.to_ascii_lowercase();
-    if normalized == "usage_daily_rollups"
-        || (normalized.contains("usage") && normalized.contains("rollup"))
-        || (normalized.contains("daily") && normalized.contains("usage"))
-    {
-        Some(TableKind::Rollup)
-    } else if normalized == "proxy_request_logs"
-        || normalized.contains("request")
-        || normalized.contains("proxy_log")
-    {
-        Some(TableKind::Log)
-    } else {
-        None
-    }
-}
-
-fn build_rollup_fragment(table: &TableInfo) -> Option<String> {
-    let date = find_column(table, &["date", "date_key", "day", "created_at"])?;
-    let input = find_column(
-        table,
-        &["input_tokens", "prompt_tokens", "input_token_count"],
-    );
-    let output = find_column(
-        table,
-        &["output_tokens", "completion_tokens", "output_token_count"],
-    );
-    let cache_read = find_column(
-        table,
-        &["cache_read_tokens", "cache_read_input_tokens", "cache_read"],
-    );
-    let cache_creation = find_column(
-        table,
-        &[
-            "cache_creation_tokens",
-            "cache_creation_input_tokens",
-            "cache_creation",
-        ],
-    );
-    if input.is_none() && output.is_none() && cache_read.is_none() && cache_creation.is_none() {
-        return None;
-    }
-
-    let alias = "r";
-    let date_expression = date_expression(alias, &date);
-    let app_expression = app_expression(
-        alias,
-        find_column(table, &["app_type", "app", "provider", "source"]),
-    );
-    let input_expression = number_expression(alias, input.as_deref());
-    let output_expression = number_expression(alias, output.as_deref());
-    let cache_read_expression = number_expression(alias, cache_read.as_deref());
-    let cache_creation_expression = number_expression(alias, cache_creation.as_deref());
-    let fresh_input = fresh_input_expression(
-        &input_expression,
-        &output_expression,
-        &cache_read_expression,
-        &cache_creation_expression,
-        &app_expression,
-        optional_number_expression(alias, find_column(table, &["input_token_semantics"])),
-    );
-    let total_expression = format!(
-        "({fresh_input} + {output_expression} + {cache_read_expression} + {cache_creation_expression})"
-    );
-    let request_expression = number_expression(
-        alias,
-        find_column(table, &["request_count", "requests", "request_total"]).as_deref(),
-    );
-
-    Some(format!(
-        "SELECT {date_expression} AS date_key, {app_expression} AS app_type, \
-                SUM({request_expression}) AS requests, \
-                SUM({fresh_input}) AS input_tokens, \
-                SUM({output_expression}) AS output_tokens, \
-                SUM({cache_read_expression}) AS cache_read_tokens, \
-                SUM({cache_creation_expression}) AS cache_creation_tokens, \
-                SUM({total_expression}) AS total_tokens \
-           FROM {} {alias} \
-          GROUP BY {date_expression}, {app_expression}",
-        quote_identifier(&table.name)
-    ))
-}
-
-fn build_log_fragment(table: &TableInfo) -> Option<String> {
-    let created = find_column(
-        table,
-        &["created_at", "timestamp", "created", "request_time"],
-    )?;
-    let input = find_column(
-        table,
-        &["input_tokens", "prompt_tokens", "input_token_count"],
-    );
-    let output = find_column(
-        table,
-        &["output_tokens", "completion_tokens", "output_token_count"],
-    );
-    let cache_read = find_column(
-        table,
-        &["cache_read_tokens", "cache_read_input_tokens", "cache_read"],
-    );
-    let cache_creation = find_column(
-        table,
-        &[
-            "cache_creation_tokens",
-            "cache_creation_input_tokens",
-            "cache_creation",
-        ],
-    );
-    if input.is_none() && output.is_none() && cache_read.is_none() && cache_creation.is_none() {
-        return None;
-    }
-
-    let alias = "l";
-    let date_expression = date_expression(alias, &created);
-    let app_expression = app_expression(
-        alias,
-        find_column(table, &["app_type", "app", "provider", "source"]),
-    );
-    let input_expression = number_expression(alias, input.as_deref());
-    let output_expression = number_expression(alias, output.as_deref());
-    let cache_read_expression = number_expression(alias, cache_read.as_deref());
-    let cache_creation_expression = number_expression(alias, cache_creation.as_deref());
-    let fresh_input = fresh_input_expression(
-        &input_expression,
-        &output_expression,
-        &cache_read_expression,
-        &cache_creation_expression,
-        &app_expression,
-        optional_number_expression(alias, find_column(table, &["input_token_semantics"])),
-    );
-    let total_expression = format!(
-        "({fresh_input} + {output_expression} + {cache_read_expression} + {cache_creation_expression})"
-    );
-    let status_filter = find_column(table, &["status_code", "status"])
-        .map(|column| {
-            let expression = qualified(alias, &column);
-            format!(
-                "WHERE CAST({expression} AS INTEGER) >= 200 AND CAST({expression} AS INTEGER) < 300"
-            )
-        })
-        .unwrap_or_default();
-
-    Some(format!(
-        "SELECT {date_expression} AS date_key, {app_expression} AS app_type, \
-                COUNT(*) AS requests, \
-                SUM({fresh_input}) AS input_tokens, \
-                SUM({output_expression}) AS output_tokens, \
-                SUM({cache_read_expression}) AS cache_read_tokens, \
-                SUM({cache_creation_expression}) AS cache_creation_tokens, \
-                SUM({total_expression}) AS total_tokens \
-           FROM {} {alias} \
-          {status_filter} \
-          GROUP BY {date_expression}, {app_expression}",
-        quote_identifier(&table.name)
-    ))
-}
-
-fn find_column(table: &TableInfo, aliases: &[&str]) -> Option<String> {
-    aliases
-        .iter()
-        .find_map(|alias| table.columns.get(*alias).cloned())
-}
-
-fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-fn qualified(alias: &str, column: &str) -> String {
-    format!("{alias}.{}", quote_identifier(column))
-}
-
-fn number_expression(alias: &str, column: Option<&str>) -> String {
-    match column {
-        Some(column) => format!("COALESCE(CAST({} AS INTEGER), 0)", qualified(alias, column)),
-        None => "0".to_string(),
-    }
-}
-
-fn optional_number_expression(alias: &str, column: Option<String>) -> Option<String> {
-    column.map(|column| format!("CAST({} AS INTEGER)", qualified(alias, &column)))
-}
-
-fn app_expression(alias: &str, column: Option<String>) -> String {
-    match column {
-        Some(column) => format!(
-            "COALESCE(NULLIF(CAST({} AS TEXT), ''), 'unknown')",
-            qualified(alias, &column)
-        ),
-        None => "'unknown'".to_string(),
-    }
-}
-
-fn date_expression(alias: &str, column: &str) -> String {
-    let value = qualified(alias, column);
+fn format_date(date: time::Date) -> String {
     format!(
-        "COALESCE(CASE WHEN typeof({value}) IN ('integer', 'real') \
-             THEN date(CASE WHEN {value} > 100000000000 THEN {value} / 1000 ELSE {value} END, 'unixepoch', 'localtime') \
-             ELSE date({value}, 'localtime') END, '')"
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        date.month() as u8,
+        date.day()
     )
-}
-
-fn fresh_input_expression(
-    input: &str,
-    _output: &str,
-    cache_read: &str,
-    cache_creation: &str,
-    app: &str,
-    semantics: Option<String>,
-) -> String {
-    let legacy = format!(
-        "CASE \
-           WHEN {app} IN ('codex', 'gemini', 'grokbuild') \
-                AND {input} >= {cache_read} + {cache_creation} \
-             THEN {input} - {cache_read} - {cache_creation} \
-           WHEN {app} IN ('codex', 'gemini', 'grokbuild') \
-                AND {input} >= {cache_read} \
-             THEN {input} - {cache_read} \
-           ELSE {input} \
-         END"
-    );
-    match semantics {
-        Some(semantics) => format!(
-            "CASE \
-               WHEN {semantics} = 2 THEN {input} \
-               WHEN {semantics} = 1 AND {input} >= {cache_read} + {cache_creation} \
-                 THEN {input} - {cache_read} - {cache_creation} \
-               ELSE {legacy} \
-             END"
-        ),
-        None => legacy,
-    }
-}
-
-fn today_key(connection: &Connection) -> Result<String, SyncStatus> {
-    connection
-        .query_row("SELECT date('now', 'localtime')", [], |row| row.get(0))
-        .map_err(|_| SyncStatus::QueryFailed)
 }
 
 fn add_totals(target: &mut TokenTotals, source: &TokenTotals) {
@@ -864,10 +899,14 @@ fn add_totals(target: &mut TokenTotals, source: &TokenTotals) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_tokens, query_snapshot};
-    use rusqlite::Connection;
-    use std::env;
-    use std::path::PathBuf;
+    use super::{
+        format_tokens, parse_claude_record, parse_codex_record, read_source_file, SourceFile,
+        SourceKind,
+    };
+    use serde_json::json;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn formats_tokens_with_commas() {
@@ -876,76 +915,116 @@ mod tests {
     }
 
     #[test]
-    fn reads_current_cc_switch_schema() {
-        let connection = Connection::open_in_memory().expect("open in-memory database");
-        connection
-            .execute_batch(
-                "CREATE TABLE usage_daily_rollups (
-                    date TEXT,
-                    app_type TEXT,
-                    request_count INTEGER,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    cache_read_tokens INTEGER,
-                    cache_creation_tokens INTEGER,
-                    input_token_semantics INTEGER
-                );
-                CREATE TABLE proxy_request_logs (
-                    created_at INTEGER,
-                    app_type TEXT,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    cache_read_tokens INTEGER,
-                    cache_creation_tokens INTEGER,
-                    input_token_semantics INTEGER,
-                    status_code INTEGER
-                );
-                INSERT INTO usage_daily_rollups VALUES
-                    (date('now', 'localtime'), 'codex', 2, 100, 30, 20, 10, 1);",
-            )
-            .expect("create current schema");
-
-        let snapshot = query_snapshot(&connection).expect("read current schema");
-        assert_eq!(snapshot.today.total_tokens, 130);
-        assert_eq!(snapshot.today.requests, 2);
-        assert_eq!(snapshot.daily.len(), 7);
-        assert_eq!(snapshot.daily.last().map(|day| day.total_tokens), Some(130));
+    fn parses_claude_usage_from_assistant_message() {
+        let value = json!({
+            "type": "assistant",
+            "timestamp": "2026-09-17T12:00:00.000Z",
+            "message": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 30,
+                    "cache_read_input_tokens": 20,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 10,
+                        "ephemeral_1h_input_tokens": 5
+                    }
+                }
+            }
+        });
+        let row = parse_claude_record(&value, "fixture:0").expect("parse Claude usage");
+        assert_eq!(row.app_type, "claude");
+        assert_eq!(row.totals.input_tokens, 100);
+        assert_eq!(row.totals.cache_read_tokens, 20);
+        assert_eq!(row.totals.cache_creation_tokens, 15);
+        assert_eq!(row.totals.total_tokens, 165);
     }
 
     #[test]
-    fn reads_future_schema_aliases_without_semantics_column() {
-        let connection = Connection::open_in_memory().expect("open in-memory database");
-        connection
-            .execute_batch(
-                "CREATE TABLE usage_daily (
-                    day TEXT,
-                    provider TEXT,
-                    requests INTEGER,
-                    prompt_tokens INTEGER,
-                    completion_tokens INTEGER,
-                    cache_read INTEGER,
-                    cache_creation INTEGER
-                );
-                INSERT INTO usage_daily VALUES
-                    (date('now', 'localtime'), 'claude', 2, 100, 30, 20, 10);",
-            )
-            .expect("create future schema");
-
-        let snapshot = query_snapshot(&connection).expect("read future schema");
-        assert_eq!(snapshot.today.total_tokens, 160);
-        assert_eq!(snapshot.today.requests, 2);
+    fn merges_streaming_claude_snapshots_by_message_id() {
+        let first = json!({
+            "type": "assistant",
+            "timestamp": "2026-09-17T12:00:00.000Z",
+            "sessionId": "session-1",
+            "requestId": "request-1",
+            "message": { "id": "message-1", "usage": { "input_tokens": 100, "output_tokens": 10 } }
+        });
+        let second = json!({
+            "type": "assistant",
+            "timestamp": "2026-09-17T12:00:01.000Z",
+            "sessionId": "session-1",
+            "requestId": "request-1",
+            "message": { "id": "message-1", "usage": { "input_tokens": 100, "output_tokens": 30 } }
+        });
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("token-tray-claude-dedupe-{timestamp}.jsonl"));
+        let content = format!("{}\n{}\n", first, second);
+        fs::write(&path, content).expect("write dedupe fixture");
+        let rows = read_source_file(&SourceFile {
+            path: path.clone(),
+            kind: SourceKind::Claude,
+        })
+        .expect("read dedupe fixture");
+        let _ = fs::remove_file(path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].totals.total_tokens, 130);
     }
 
     #[test]
-    fn reads_configured_database_when_present() {
-        let Some(path) = env::var_os(super::DATABASE_ENV) else {
-            return;
-        };
-        let path = PathBuf::from(path);
-        if !path.is_file() {
-            return;
-        }
-        let snapshot = super::read_snapshot(&path).expect("read configured database");
-        assert!(!snapshot.source.is_empty());
+    fn uses_codex_last_usage_instead_of_cumulative_total() {
+        let first = json!({
+            "type": "event_msg",
+            "timestamp": "2026-09-17T12:00:00.000Z",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": { "input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "total_tokens": 110 },
+                    "last_token_usage": { "input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10, "total_tokens": 110 }
+                }
+            }
+        });
+        let second = json!({
+            "type": "event_msg",
+            "timestamp": "2026-09-17T12:01:00.000Z",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": { "input_tokens": 180, "cached_input_tokens": 40, "output_tokens": 15, "total_tokens": 195 },
+                    "last_token_usage": { "input_tokens": 80, "cached_input_tokens": 20, "output_tokens": 5, "total_tokens": 85 }
+                }
+            }
+        });
+        let mut previous = None;
+        let first_row = parse_codex_record(&first, &mut previous).expect("first Codex usage");
+        let second_row = parse_codex_record(&second, &mut previous).expect("second Codex usage");
+        assert_eq!(first_row.totals.total_tokens, 110);
+        assert_eq!(second_row.totals.total_tokens, 85);
+        assert_eq!(second_row.totals.requests, 1);
+    }
+
+    #[test]
+    fn reads_jsonl_and_ignores_partial_last_line() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("token-tray-usage-{timestamp}-{id}.jsonl"));
+        let content = concat!(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-17T12:00:00Z\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}\n",
+            "{\"type\":\"assistant\""
+        );
+        fs::write(&path, content).expect("write fixture");
+        let rows = read_source_file(&SourceFile {
+            path: path.clone(),
+            kind: SourceKind::Claude,
+        })
+        .expect("read fixture");
+        let _ = fs::remove_file(path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].totals.total_tokens, 12);
     }
 }

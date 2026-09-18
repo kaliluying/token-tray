@@ -1,6 +1,6 @@
 # Token Tray
 
-Windows 任务栏和 macOS 菜单栏 token 统计小工具，直接只读读取 CC Switch 的本地统计数据库。
+Windows 任务栏和 macOS 菜单栏 token 统计小工具，直接只读读取 Claude Code/Codex 的本地会话文件并计算。
 
 ## 功能
 
@@ -8,30 +8,36 @@ Windows 任务栏和 macOS 菜单栏 token 统计小工具，直接只读读取 
 - 点击任务栏数字打开详情面板，查看周期概览、输入/输出/cache 和按应用统计。
 - 详情面板支持关闭按钮和点击窗口外自动隐藏。
 - 同一台电脑只允许一个实例运行，重复启动会聚焦已有详情面板。
-- Rust 后台每 5 秒只读取一次数据库，再通过事件同时推送给任务栏和详情面板。
+- Rust 后台每 5 秒扫描本地会话文件，再通过事件同时推送给任务栏和详情面板。
 - 详情面板支持 Escape 关闭；点击“刷新”才会主动触发一次读取。
 - 点击数字可手动刷新；数据变化使用平滑增长动画。
-- CC Switch 正在写入数据库时自动等待，减少瞬时读取失败。
+- 客户端正在追加 JSONL 时跳过未完成的尾行，下一轮自动重试。
+- Claude Code 按消息 Token 快照去重，Codex 按累计快照计算增量，避免重复累加。
 - Windows 和 macOS 默认启用开机自启，可通过托盘菜单关闭。
 - 读取失败时保留上一次成功的数据，托盘悬停提示会显示 token、最近同步时间和错误状态。
-- 自动发现 CC Switch 的常见安装目录，并通过表名/列名兼容可识别的未来 schema 变化。
+- 自动发现 Claude Code/Codex 的常见本地会话目录，兼容 `CLAUDE_CONFIG_DIR` 和 `CODEX_HOME`。
 - 发布版启动时检查 GitHub Release；发现已签名更新后自动下载、安装并重启。
 - 诊断日志只记录生命周期、同步结果类别和事件错误，不记录 token 数值、密钥、请求内容或数据库路径。
 
-## 数据来源
+## 本地 Token 数据来源
 
-默认自动发现：
+默认自动发现并递归读取 `.jsonl` 文件：
 
 ```text
-Windows: %USERPROFILE%\.cc-switch\cc-switch.db、%APPDATA%\cc-switch\cc-switch.db、%LOCALAPPDATA%\cc-switch\cc-switch.db
-macOS:   ~/.cc-switch/cc-switch.db、~/Library/Application Support/cc-switch/cc-switch.db
+Claude Code: %USERPROFILE%\.claude\projects\**\*.jsonl
+Codex:       %USERPROFILE%\.codex\sessions\**\*.jsonl
+             %USERPROFILE%\.codex\archived_sessions\**\*.jsonl
+
+macOS/Linux:
+Claude Code: ~/.claude/projects/**/*.jsonl、~/.config/claude/projects/**/*.jsonl
+Codex:       ~/.codex/sessions/**/*.jsonl、~/.codex/archived_sessions/**/*.jsonl
 ```
 
-也可以通过 `CC_SWITCH_DB_PATH` 指定数据库文件。数据库以只读方式打开，不修改 CC Switch 数据。
+也支持使用 `CLAUDE_CONFIG_DIR`（可用逗号分隔多个目录）和 `CODEX_HOME` 指定配置根目录。读取失败时保留上一次成功的数据；详情页会标注“本地日志估算”。
 
 ## 自定义余额
 
-详情面板的“余额”卡片支持按 CC Switch 的请求模板读取自定义接口。点击卡片右上角“配置”，应用会创建并打开：
+详情面板的“余额”卡片支持按请求模板读取自定义接口。点击卡片右上角“配置”，应用会创建并打开：
 
 ```text
 Windows: %APPDATA%\com.token-tray.app\balance.json
@@ -57,7 +63,7 @@ macOS:   ~/Library/Application Support/com.token-tray.app/balance.json
 }
 ```
 
-上面的 `extractor` 等价于 CC Switch 模板中的 `+response.balance_usd`。也支持把 extractor 写成 JSON 字符串形式的 CC Switch 函数，例如：
+上面的 `extractor` 使用 JSON 路径读取余额字段。也支持把 extractor 写成 JSON 字符串形式的函数，例如：
 
 ```json
 "extractor": "function(response) { return { remaining: +response.balance_usd, unit: \"USD\" }; }"
@@ -123,4 +129,4 @@ pnpm tauri build
 
 - 开发模式不会写入开机自启配置。
 - Windows 版本将窗口挂载到任务栏，因此需要在任务栏位置变化后重新定位。
-- CC Switch 未安装或数据库不存在时，工具会保留当前显示并在悬停提示错误。
+- 本地会话目录不存在或文件格式不兼容时，工具会保留当前显示并在悬停提示错误。
