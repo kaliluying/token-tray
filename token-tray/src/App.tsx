@@ -338,6 +338,7 @@ function DetailsPanel({
   const { today } = snapshot;
   const [animationPhase, setAnimationPhase] = useState<DetailsAnimationPhase>("idle");
   const animationFrameRef = useRef<number | null>(null);
+  const detailsPageRef = useRef<HTMLElement | null>(null);
   const overview = [
     { label: "近 7 天", value: snapshot.lastSevenDays.totalTokens },
     { label: "本月", value: snapshot.month.totalTokens },
@@ -371,6 +372,12 @@ function DetailsPanel({
     });
   }, []);
 
+  const focusDetailsSurface = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      detailsPageRef.current?.focus({ preventScroll: true });
+    });
+  }, []);
+
   useEffect(() => {
     let disposed = false;
     let unlistenOpening: (() => void) | undefined;
@@ -379,10 +386,16 @@ function DetailsPanel({
 
     const setup = async () => {
       const [opening, closing, focus] = await Promise.all([
-        listen("details-window-opening", () => playAnimation("opening")),
+        listen("details-window-opening", () => {
+          focusDetailsSurface();
+          playAnimation("opening");
+        }),
         listen("details-window-closing", () => playAnimation("closing")),
         currentAppWindow.onFocusChanged(({ payload }) => {
-          if (payload) playAnimation("opening");
+          if (payload) {
+            focusDetailsSurface();
+            playAnimation("opening");
+          }
         }),
       ]);
       if (disposed) {
@@ -396,6 +409,7 @@ function DetailsPanel({
       unlistenFocus = focus;
 
       if (await currentAppWindow.isFocused()) {
+        focusDetailsSurface();
         playAnimation("opening");
       }
     };
@@ -410,7 +424,7 @@ function DetailsPanel({
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [playAnimation]);
+  }, [focusDetailsSurface, playAnimation]);
 
   return (
     <div
@@ -418,7 +432,7 @@ function DetailsPanel({
         animationPhase === "idle" ? "" : ` is-${animationPhase}`
       }`}
     >
-      <main className="details-page">
+      <main className="details-page" ref={detailsPageRef} tabIndex={-1}>
         <header className="details-header">
           <div>
             <span className="details-kicker">{statsMode === "local" ? "本地日志估算" : "Token 统计"}</span>

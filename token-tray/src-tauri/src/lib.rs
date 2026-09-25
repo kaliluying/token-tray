@@ -102,7 +102,6 @@ pub fn run() {
                         .ok_or_else(|| "找不到应用图标资源".to_string())?,
                 )
                 .tooltip("Token Tray")
-                .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "show" => {
@@ -119,18 +118,34 @@ pub fn run() {
                     _ => {}
                 });
 
+            #[cfg(not(target_os = "macos"))]
             {
-                tray_builder = tray_builder.on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let _ = toggle_details_window(tray.app_handle().clone());
-                    }
-                });
+                tray_builder = tray_builder.menu(&menu);
             }
+
+            tray_builder = tray_builder.on_tray_icon_event(move |tray, event| {
+                if let TrayIconEvent::Click {
+                    button,
+                    button_state,
+                    ..
+                } = event
+                {
+                    match (button, button_state) {
+                        (MouseButton::Left, MouseButtonState::Up) => {
+                            let _ = toggle_details_window(tray.app_handle().clone());
+                        }
+                        #[cfg(target_os = "macos")]
+                        (MouseButton::Right, MouseButtonState::Down) => {
+                            if let Some(details) = tray.app_handle().get_webview_window("details") {
+                                if let Err(error) = details.popup_menu(&menu) {
+                                    eprintln!("无法打开托盘菜单: {error}");
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
 
             #[cfg(target_os = "macos")]
             {

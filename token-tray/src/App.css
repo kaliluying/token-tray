@@ -69,6 +69,7 @@ button { font: inherit; }
   border-radius: 22px;
   box-shadow: inset 0 1px 1px rgba(255, 255, 255, .88);
   clip-path: inset(0 round 22px);
+  outline: none;
 }
 
 @keyframes details-pop-in {
@@ -90,13 +91,14 @@ button { font: inherit; }
 .details-header { margin-bottom: 18px; }
 .details-kicker { color: #66809b; font-size: 11px; font-weight: 700; letter-spacing: .08em; }
 .details-header h1 { margin: 4px 0 0; color: #14283d; font-size: 23px; letter-spacing: -.04em; }
-.close-button { width: 28px; height: 28px; display: grid; place-items: center; padding: 0 0 3px; color: #4a6883; background: rgba(255, 255, 255, .46); border: 1px solid rgba(255, 255, 255, .66); border-radius: 50%; cursor: pointer; font-size: 22px; line-height: 1; }
+.close-button { width: 28px; height: 28px; display: grid; place-items: center; padding: 0 0 3px; color: #4a6883; background: rgba(255, 255, 255, .46); border: 1px solid rgba(255, 255, 255, .66); border-radius: 50%; cursor: pointer; font-size: 22px; line-height: 1; outline: none; -webkit-appearance: none; }
 .stats-mode-switch { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px; margin: -8px 0 12px; padding: 3px; background: rgba(255, 255, 255, .3); border: 1px solid rgba(255, 255, 255, .6); border-radius: 10px; }
 .stats-mode-switch button { min-height: 27px; padding: 4px 8px; color: #71859a; background: transparent; border: 0; border-radius: 7px; cursor: pointer; font-size: 10px; font-weight: 750; }
 .stats-mode-switch button:hover { color: #3f6f91; background: rgba(255, 255, 255, .42); }
 .stats-mode-switch button.is-active { color: #214e70; background: rgba(255, 255, 255, .86); box-shadow: 0 2px 5px rgba(62, 103, 133, .12); }
 .stats-mode-switch button:focus-visible { outline: 2px solid rgba(48, 103, 143, .42); outline-offset: 1px; }
 .close-button:hover { background: rgba(255, 255, 255, .76); }
+.close-button:focus-visible { outline: 2px solid rgba(68, 128, 188, .58); outline-offset: 2px; }
 
 .details-hero { padding: 18px 18px 16px; background: rgba(255, 255, 255, .42); border: 1px solid rgba(255, 255, 255, .68); border-radius: 17px; box-shadow: inset 0 1px 1px rgba(255, 255, 255, .72); }
 .details-total { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
