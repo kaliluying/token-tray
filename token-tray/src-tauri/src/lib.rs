@@ -1,5 +1,7 @@
 mod autostart;
 mod balance;
+#[cfg(target_os = "macos")]
+mod details_panel;
 mod diagnostics;
 mod relay;
 mod usage;
@@ -17,6 +19,7 @@ use tauri::WindowEvent;
 use tauri::{Emitter, Manager};
 
 const DETAILS_ANIMATION_DURATION_MS: u64 = 180;
+const DETAILS_FOCUS_LOSS_GRACE_PERIOD_MS: u64 = 240;
 
 #[derive(Clone, Default)]
 struct DetailsWindowState {
@@ -31,11 +34,15 @@ impl DetailsWindowState {
     fn is_current(&self, generation: u64) -> bool {
         self.generation.load(Ordering::SeqCst) == generation
     }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(usage::UsageStore::default())
         .manage(balance::BalanceStore::default())
         .manage(relay::RelayUsageStore::default())
@@ -45,7 +52,12 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build());
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+
+    builder
         .setup(|app| {
             diagnostics::record(app.handle(), "lifecycle", "started");
             let autostart_enabled = if cfg!(debug_assertions) {
@@ -53,9 +65,22 @@ pub fn run() {
             } else {
                 autostart::initialize().unwrap_or_else(|error| {
                     eprintln!("无法启用开机自启: {error}");
-                    true
+                    false
                 })
             };
+
+            #[cfg(target_os = "macos")]
+            app.handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+            #[cfg(target_os = "macos")]
+            if let Some(details) = app.get_webview_window("details") {
+                details.set_visible_on_all_workspaces(true)?;
+                details_panel::initialize(&details).map_err(std::io::Error::other)?;
+            }
+
+            #[cfg(target_os = "macos")]
+            install_details_outside_click_monitor(app.handle().clone());
 
             let show = MenuItem::with_id(app, "show", "打开统计面板", true, None::<&str>)?;
             let autostart = CheckMenuItem::with_id(
@@ -141,14 +166,7 @@ pub fn run() {
                 let _ = window.hide();
             }
             WindowEvent::Focused(false) if window.label() == "details" => {
-                let cursor_is_over_taskbar = window
-                    .app_handle()
-                    .get_webview_window("main")
-                    .map(|main| cursor_over_window(&main).unwrap_or(false))
-                    .unwrap_or(false);
-                if !cursor_is_over_taskbar {
-                    let _ = request_hide_details_window(window.app_handle().clone());
-                }
+                schedule_hide_after_focus_loss(window.app_handle().clone());
             }
             _ => {}
         })
@@ -179,6 +197,8 @@ fn show_details_window(app: tauri::AppHandle) -> Result<(), String> {
     details
         .set_visible_on_all_workspaces(true)
         .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    details_panel::initialize_if_needed(&details)?;
 
     #[cfg(target_os = "macos")]
     let positioned_from_tray = position_details_window_from_tray(&app, &details)?;
@@ -197,10 +217,54 @@ fn show_details_window(app: tauri::AppHandle) -> Result<(), String> {
         }
     }
 
-    let _ = app.emit_to("details", "details-window-opening", ());
+    #[cfg(target_os = "macos")]
+    details_panel::show(&app, &details)?;
+    #[cfg(not(target_os = "macos"))]
     details.show().map_err(|error| error.to_string())?;
+    #[cfg(not(target_os = "macos"))]
     details.set_focus().map_err(|error| error.to_string())?;
+    let app_for_opening_event = app.clone();
+    details
+        .run_on_main_thread(move || {
+            let _ = app_for_opening_event.emit_to("details", "details-window-opening", ());
+        })
+        .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_details_outside_click_monitor(app: tauri::AppHandle) {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    use std::ptr::NonNull;
+
+    let mask =
+        NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown | NSEventMask::OtherMouseDown;
+    let handler = RcBlock::new(move |_event: NonNull<NSEvent>| {
+        let Some(details) = app.get_webview_window("details") else {
+            return;
+        };
+        if should_hide_details_after_external_click(details.is_visible().unwrap_or(false), false) {
+            let _ = request_hide_details_window(app.clone());
+        }
+    });
+
+    if let Some(monitor) = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &handler) {
+        // The monitor lives for the lifetime of the accessory process. AppKit owns the
+        // callback registration; intentionally keep the token alive until process exit.
+        std::mem::forget(monitor);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fullscreen_collection_behavior(
+    current: objc2_app_kit::NSWindowCollectionBehavior,
+) -> objc2_app_kit::NSWindowCollectionBehavior {
+    current
+        | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+        | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+        | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+        | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
 }
 
 #[cfg(target_os = "macos")]
@@ -257,6 +321,39 @@ fn hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
     request_hide_details_window(app)
 }
 
+fn schedule_hide_after_focus_loss(app: tauri::AppHandle) {
+    let animation_state = app.state::<DetailsWindowState>().inner().clone();
+    let generation = animation_state.current_generation();
+    let app_for_main_thread = app.clone();
+    let app_for_hide = app.clone();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(DETAILS_FOCUS_LOSS_GRACE_PERIOD_MS));
+        let _ = app_for_main_thread.run_on_main_thread(move || {
+            if !animation_state.is_current(generation) {
+                return;
+            }
+            let Some(details) = app_for_hide.get_webview_window("details") else {
+                return;
+            };
+            let details_visible = details.is_visible().unwrap_or(false);
+            let details_focused = details.is_focused().unwrap_or(false);
+            let cursor_is_over_taskbar = app_for_hide
+                .get_webview_window("main")
+                .map(|main| cursor_over_window(&main).unwrap_or(false))
+                .unwrap_or(false);
+
+            if should_hide_details_after_focus_loss(
+                details_visible,
+                details_focused,
+                cursor_is_over_taskbar,
+            ) {
+                let _ = request_hide_details_window(app_for_hide.clone());
+            }
+        });
+    });
+}
+
 fn request_hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
     let Some(details) = app.get_webview_window("details") else {
         return Ok(());
@@ -269,6 +366,9 @@ fn request_hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
     let generation = animation_state.next_generation();
     let _ = app.emit_to("details", "details-window-closing", ());
 
+    #[cfg(target_os = "macos")]
+    details_panel::begin_close(&app, &details)?;
+
     let app_for_main_thread = app.clone();
     let app_for_lookup = app.clone();
     std::thread::spawn(move || {
@@ -278,12 +378,32 @@ fn request_hide_details_window(app: tauri::AppHandle) -> Result<(), String> {
                 return;
             }
             if let Some(details) = app_for_lookup.get_webview_window("details") {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = details_panel::hide(&app_for_lookup, &details);
+                }
+                #[cfg(not(target_os = "macos"))]
                 let _ = details.hide();
             }
         });
     });
 
     Ok(())
+}
+
+fn should_hide_details_after_focus_loss(
+    details_visible: bool,
+    details_focused: bool,
+    cursor_is_over_taskbar: bool,
+) -> bool {
+    details_visible && !details_focused && !cursor_is_over_taskbar
+}
+
+fn should_hide_details_after_external_click(
+    details_visible: bool,
+    clicked_inside_details: bool,
+) -> bool {
+    details_visible && !clicked_inside_details
 }
 
 fn position_below_anchor(
@@ -548,7 +668,10 @@ mod tests {
 
 #[cfg(test)]
 mod details_position_tests {
-    use super::position_below_anchor;
+    use super::{
+        position_below_anchor, should_hide_details_after_external_click,
+        should_hide_details_after_focus_loss,
+    };
 
     #[test]
     fn positions_details_below_tray_and_inside_work_area() {
@@ -563,6 +686,38 @@ mod details_position_tests {
         );
 
         assert_eq!(position, tauri::PhysicalPosition::new(0, 34));
+    }
+
+    #[test]
+    fn does_not_hide_details_during_focus_recovery_or_tray_interaction() {
+        assert!(!should_hide_details_after_focus_loss(true, true, false));
+        assert!(!should_hide_details_after_focus_loss(true, false, true));
+        assert!(should_hide_details_after_focus_loss(true, false, false));
+    }
+
+    #[test]
+    fn hides_details_when_a_visible_panel_receives_an_external_click() {
+        assert!(should_hide_details_after_external_click(true, false));
+        assert!(!should_hide_details_after_external_click(true, true));
+        assert!(!should_hide_details_after_external_click(false, false));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_window_behavior_tests {
+    use super::fullscreen_collection_behavior;
+    use objc2_app_kit::NSWindowCollectionBehavior;
+
+    #[test]
+    fn includes_fullscreen_auxiliary_behavior_without_dropping_existing_flags() {
+        let existing = NSWindowCollectionBehavior::Stationary;
+        let behavior = fullscreen_collection_behavior(existing);
+
+        assert!(behavior.contains(NSWindowCollectionBehavior::CanJoinAllSpaces));
+        assert!(behavior.contains(NSWindowCollectionBehavior::CanJoinAllApplications));
+        assert!(behavior.contains(NSWindowCollectionBehavior::Stationary));
+        assert!(behavior.contains(NSWindowCollectionBehavior::FullScreenAuxiliary));
+        assert!(behavior.contains(NSWindowCollectionBehavior::Stationary));
     }
 }
 

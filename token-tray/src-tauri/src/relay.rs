@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, create_dir_all, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -94,7 +94,39 @@ impl RelayUsageStore {
             }
         }
 
-        let snapshot = fetch();
+        let mut snapshot = fetch();
+        if snapshot.error.is_none()
+            && snapshot
+                .services
+                .iter()
+                .any(|service| service.error.is_some())
+        {
+            snapshot.error = Some("部分中转站服务读取失败".to_string());
+        }
+        if snapshot.error.is_some() && snapshot.configured {
+            if let Some(previous) = cache.as_ref().map(|cached| &cached.snapshot) {
+                let same_services = snapshot.services.is_empty()
+                    || (snapshot.services.len() == previous.services.len()
+                        && snapshot
+                            .services
+                            .iter()
+                            .zip(&previous.services)
+                            .all(|(current, old)| current.id == old.id));
+                if previous.configured
+                    && previous.config_path == snapshot.config_path
+                    && previous.updated_at.is_some()
+                    && previous
+                        .services
+                        .iter()
+                        .all(|service| service.error.is_none())
+                    && same_services
+                {
+                    snapshot.name = previous.name.clone();
+                    snapshot.services = previous.services.clone();
+                    snapshot.updated_at = previous.updated_at;
+                }
+            }
+        }
         *cache = Some(CachedRelayUsage {
             fetched_at: Instant::now(),
             snapshot: snapshot.clone(),
@@ -332,8 +364,10 @@ fn fetch_service(
         return Err(format!("中转站接口返回 HTTP {}", status.as_u16()));
     }
 
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    response
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|_| "无法读取中转站接口响应".to_string())?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err("中转站接口响应过大".to_string());
@@ -494,6 +528,8 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     use super::{
         parse_service_response, resolve_api_key, substitute_template, RelayConfig, RelayRequest,
@@ -569,5 +605,92 @@ mod tests {
             resolve_api_key(&config, &service).expect("resolve service key"),
             Some("boost-key".to_string())
         );
+    }
+
+    #[test]
+    fn keeps_complete_relay_snapshot_when_a_service_fails() {
+        let store = super::RelayUsageStore::default();
+        let service = super::RelayServiceSnapshot {
+            id: "pay".to_string(),
+            name: "Pay".to_string(),
+            status: "active".to_string(),
+            active: Some(true),
+            balance_usd: Some(10.0),
+            windows: BTreeMap::new(),
+            error: None,
+        };
+        let original = store.get_or_fetch(|| super::RelayUsageSnapshot {
+            configured: true,
+            name: "Relay".to_string(),
+            services: vec![service.clone()],
+            updated_at: Some(1),
+            config_path: "relay.json".to_string(),
+            error: None,
+        });
+        for _ in 0..2 {
+            let mut cache = store.cache.lock().expect("relay cache");
+            cache.as_mut().expect("cached relay").fetched_at =
+                std::time::Instant::now() - super::RELAY_CACHE_TTL;
+            drop(cache);
+            let mut failed_service = service.clone();
+            failed_service.balance_usd = None;
+            failed_service.error = Some("network error".to_string());
+            let failed = store.get_or_fetch(|| super::RelayUsageSnapshot {
+                configured: true,
+                name: "Relay".to_string(),
+                services: vec![failed_service],
+                updated_at: Some(2),
+                config_path: "relay.json".to_string(),
+                error: None,
+            });
+            assert_eq!(
+                failed.services[0].balance_usd,
+                original.services[0].balance_usd
+            );
+            assert_eq!(failed.updated_at, original.updated_at);
+            assert!(failed.error.is_some());
+        }
+    }
+
+    #[test]
+    fn rejects_an_oversized_relay_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).expect("read fixture request");
+            let body = vec![b' '; super::MAX_RESPONSE_BYTES + 1];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("write response header");
+            let _ = stream.write_all(&body);
+        });
+        let config = RelayConfig {
+            name: "Relay".to_string(),
+            api_key: String::new(),
+            api_key_env: String::new(),
+            request: RelayRequest {
+                url: format!("http://{address}/{{{{service}}}}"),
+                method: "GET".to_string(),
+                headers: BTreeMap::new(),
+                body: None,
+            },
+            services: Vec::new(),
+        };
+        let service = RelayServiceConfig {
+            id: "pay".to_string(),
+            name: "Pay".to_string(),
+            api_key: String::new(),
+            api_key_env: String::new(),
+        };
+        let client = reqwest::blocking::Client::new();
+        let result = super::fetch_service(&client, &config, &service);
+        server.join().expect("fixture server");
+        assert_eq!(result.unwrap_err(), "中转站接口响应过大");
     }
 }

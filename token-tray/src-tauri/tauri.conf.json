@@ -22,6 +22,7 @@
         "skipTaskbar": true,
         "shadow": false,
         "transparent": true,
+        "visibleOnAllWorkspaces": true,
         "visible": false
       },
       {

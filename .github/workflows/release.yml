@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     name: Build ${{ matrix.os }}
     strategy:
       fail-fast: false

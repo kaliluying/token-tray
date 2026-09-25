@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, create_dir_all, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -72,7 +72,20 @@ impl BalanceStore {
             }
         }
 
-        let snapshot = fetch();
+        let mut snapshot = fetch();
+        if snapshot.error.is_some() && snapshot.configured {
+            if let Some(previous) = cache.as_ref().map(|cached| &cached.snapshot) {
+                if previous.configured
+                    && previous.config_path == snapshot.config_path
+                    && previous.remaining.is_some()
+                {
+                    snapshot.name = previous.name.clone();
+                    snapshot.remaining = previous.remaining;
+                    snapshot.unit = previous.unit.clone();
+                    snapshot.updated_at = previous.updated_at;
+                }
+            }
+        }
         *cache = Some(CachedBalance {
             fetched_at: Instant::now(),
             snapshot: snapshot.clone(),
@@ -264,8 +277,10 @@ fn read_and_fetch(path: &Path) -> Result<(String, f64, String), String> {
         return Err(format!("余额接口返回 HTTP {}", status.as_u16()));
     }
 
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::new();
+    response
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
         .map_err(|_| "无法读取余额接口响应".to_string())?;
     if bytes.len() > MAX_RESPONSE_BYTES {
         return Err("余额接口响应过大".to_string());
@@ -505,6 +520,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_oversized_balance_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).expect("read fixture request");
+            let body = vec![b' '; super::MAX_RESPONSE_BYTES + 1];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("write response header");
+            let _ = stream.write_all(&body);
+        });
+        let path = std::env::temp_dir().join(format!(
+            "token-tray-large-balance-{}-{}.json",
+            std::process::id(),
+            super::now_millis()
+        ));
+        let config = json!({
+            "request": {"url": format!("http://{address}/status")},
+            "extractor": {"path": "balance_usd", "unit": "USD"}
+        });
+        fs::write(&path, config.to_string()).expect("write fixture config");
+        let result = read_and_fetch(&path);
+        server.join().expect("fixture server");
+        fs::remove_file(path).expect("remove fixture config");
+        assert_eq!(result.unwrap_err(), "余额接口响应过大");
+    }
+
+    #[test]
     fn coalesces_concurrent_balance_fetches() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
@@ -542,6 +591,30 @@ mod tests {
         let second_result = second.join().expect("second fetch thread");
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
         assert_eq!(first_result.remaining, second_result.remaining);
+    }
+
+    #[test]
+    fn keeps_last_balance_and_timestamp_across_failed_refreshes() {
+        let store = super::BalanceStore::default();
+        let original = store.get_or_fetch(|| test_balance_snapshot(12.5));
+        for _ in 0..2 {
+            let mut cache = store.cache.lock().expect("balance cache");
+            cache.as_mut().expect("cached balance").fetched_at =
+                std::time::Instant::now() - super::BALANCE_CACHE_TTL;
+            drop(cache);
+            let failed = store.get_or_fetch(|| super::BalanceSnapshot {
+                configured: true,
+                name: "余额查询".to_string(),
+                remaining: None,
+                unit: String::new(),
+                updated_at: None,
+                config_path: String::new(),
+                error: Some("network error".to_string()),
+            });
+            assert_eq!(failed.remaining, original.remaining);
+            assert_eq!(failed.updated_at, original.updated_at);
+            assert_eq!(failed.error.as_deref(), Some("network error"));
+        }
     }
 
     fn test_balance_snapshot(remaining: f64) -> super::BalanceSnapshot {

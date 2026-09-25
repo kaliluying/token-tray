@@ -95,6 +95,8 @@ type DetailsAnimationPhase = "idle" | "opening" | "closing";
 
 const currentAppWindow = getCurrentWindow();
 const currentWindowLabel = currentAppWindow.label;
+const usesNativePanelAnimation =
+  typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
 
 const emptyTotals: TokenTotals = {
   requests: 0,
@@ -379,7 +381,9 @@ function DetailsPanel({
       const [opening, closing, focus] = await Promise.all([
         listen("details-window-opening", () => playAnimation("opening")),
         listen("details-window-closing", () => playAnimation("closing")),
-        currentAppWindow.onFocusChanged(({ payload }) => playAnimation(payload ? "opening" : "closing")),
+        currentAppWindow.onFocusChanged(({ payload }) => {
+          if (payload) playAnimation("opening");
+        }),
       ]);
       if (disposed) {
         opening();
@@ -390,6 +394,10 @@ function DetailsPanel({
       unlistenOpening = opening;
       unlistenClosing = closing;
       unlistenFocus = focus;
+
+      if (await currentAppWindow.isFocused()) {
+        playAnimation("opening");
+      }
     };
     void setup();
 
@@ -405,16 +413,21 @@ function DetailsPanel({
   }, [playAnimation]);
 
   return (
-    <main className={`details-page${animationPhase === "idle" ? "" : ` is-${animationPhase}`}`}>
-      <header className="details-header">
-        <div>
-          <span className="details-kicker">{statsMode === "local" ? "本地日志估算" : "Token 统计"}</span>
-          <h1>{statsMode === "local" ? "今日用量" : "中转站用量"}</h1>
-        </div>
-        <button className="close-button" type="button" onClick={() => void invoke("hide_details_window")} aria-label="关闭详情面板">
-          ×
-        </button>
-      </header>
+    <div
+      className={`details-shell${usesNativePanelAnimation ? " uses-native-motion" : ""}${
+        animationPhase === "idle" ? "" : ` is-${animationPhase}`
+      }`}
+    >
+      <main className="details-page">
+        <header className="details-header">
+          <div>
+            <span className="details-kicker">{statsMode === "local" ? "本地日志估算" : "Token 统计"}</span>
+            <h1>{statsMode === "local" ? "今日用量" : "中转站用量"}</h1>
+          </div>
+          <button className="close-button" type="button" onClick={() => void invoke("hide_details_window")} aria-label="关闭详情面板">
+            ×
+          </button>
+        </header>
 
       <div className="stats-mode-switch" role="tablist" aria-label="统计来源">
         <button
@@ -602,7 +615,8 @@ function DetailsPanel({
           刷新
         </button>
       </footer>
-    </main>
+      </main>
+    </div>
   );
 }
 

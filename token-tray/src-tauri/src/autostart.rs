@@ -146,6 +146,8 @@ pub use windows::{initialize, set_enabled};
 
 #[cfg(target_os = "macos")]
 mod macos {
+    use std::fs;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -157,6 +159,38 @@ mod macos {
             .join("Library")
             .join("LaunchAgents")
             .join(format!("{LABEL}.plist")))
+    }
+
+    fn disabled_marker_path() -> Result<PathBuf, String> {
+        let home = std::env::var_os("HOME").ok_or_else(|| "找不到当前用户目录".to_string())?;
+        Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join(LABEL)
+            .join("autostart-disabled"))
+    }
+
+    fn is_disabled() -> Result<bool, String> {
+        match fs::metadata(disabled_marker_path()?) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("无法读取开机自启设置: {error}")),
+        }
+    }
+
+    fn save_disabled(disabled: bool) -> Result<(), String> {
+        let path = disabled_marker_path()?;
+        if disabled {
+            fs::create_dir_all(path.parent().ok_or("无法确定开机自启设置目录")?)
+                .map_err(|error| error.to_string())?;
+            fs::write(path, b"").map_err(|error| error.to_string())
+        } else {
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.to_string()),
+            }
+        }
     }
 
     fn uid() -> Result<String, String> {
@@ -172,8 +206,47 @@ mod macos {
             .map_err(|error| error.to_string())
     }
 
-    fn launchctl(args: &[String]) {
-        let _ = Command::new("launchctl").args(args).status();
+    fn launchctl(args: &[String]) -> Result<(), String> {
+        let status = Command::new("launchctl")
+            .args(args)
+            .status()
+            .map_err(|error| format!("无法运行 launchctl: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("launchctl {} 失败: {status}", args[0]))
+        }
+    }
+
+    fn is_loaded(user: &str) -> Result<bool, String> {
+        let status = Command::new("launchctl")
+            .args(["print", &format!("gui/{user}/{LABEL}")])
+            .output()
+            .map_err(|error| format!("无法运行 launchctl: {error}"))?
+            .status;
+        Ok(status.success())
+    }
+
+    fn remove_plist() -> Result<(), String> {
+        match fs::remove_file(plist_path()?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn load(user: &str) -> Result<(), String> {
+        if !is_loaded(user)? {
+            let path = write_plist()?;
+            launchctl(&[
+                "bootstrap".to_string(),
+                format!("gui/{user}"),
+                path.display().to_string(),
+            ])?;
+        } else {
+            write_plist()?;
+        }
+        Ok(())
     }
 
     fn write_plist() -> Result<PathBuf, String> {
@@ -198,32 +271,90 @@ mod macos {
     }
 
     pub fn initialize() -> Result<bool, String> {
-        let path = write_plist()?;
-        let user = uid()?;
-        launchctl(&[
-            "bootstrap".to_string(),
-            format!("gui/{user}"),
-            path.display().to_string(),
-        ]);
-        Ok(true)
+        if is_disabled()? {
+            remove_plist()?;
+            Ok(false)
+        } else {
+            load(&uid()?)?;
+            Ok(true)
+        }
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), String> {
-        let path = plist_path()?;
-        let user = uid()?;
-        let domain = format!("gui/{user}/{LABEL}");
-        launchctl(&["bootout".to_string(), domain]);
         if enabled {
-            let path = write_plist()?;
-            launchctl(&[
-                "bootstrap".to_string(),
-                format!("gui/{user}"),
-                path.display().to_string(),
-            ]);
-        } else if path.is_file() {
-            std::fs::remove_file(path).map_err(|error| error.to_string())?;
+            load(&uid()?)?;
+            save_disabled(false)?;
+        } else {
+            save_disabled(true)?;
+            remove_plist()?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{disabled_marker_path, initialize, plist_path, set_enabled};
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn disabled_preference_survives_a_new_process() {
+            if std::env::var_os("TOKEN_TRAY_AUTOSTART_TEST_CHILD").is_some() {
+                assert!(initialize().expect("initialize enabled"));
+                assert!(plist_path().expect("plist path").exists());
+                set_enabled(false).expect("disable autostart");
+                assert!(disabled_marker_path().expect("marker path").exists());
+                assert!(!plist_path().expect("plist path").exists());
+                assert!(!initialize().expect("initialize disabled"));
+                set_enabled(true).expect("enable autostart");
+                assert!(!disabled_marker_path().expect("marker path").exists());
+                assert!(initialize().expect("initialize enabled again"));
+                return;
+            }
+
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!("token-tray-autostart-{timestamp}"));
+            let bin = directory.join("bin");
+            fs::create_dir_all(&bin).expect("create fixture bin");
+            let launchctl = bin.join("launchctl");
+            fs::write(
+                &launchctl,
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$TOKEN_TRAY_AUTOSTART_TEST_LOG\"\ncase \"$1\" in print) exit 1;; *) exit 0;; esac\n",
+            )
+            .expect("write fixture launchctl");
+            fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755))
+                .expect("make fixture launchctl executable");
+            let log = directory.join("launchctl.log");
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "autostart::macos::tests::disabled_preference_survives_a_new_process",
+                ])
+                .env("HOME", &directory)
+                .env("PATH", path)
+                .env("TOKEN_TRAY_AUTOSTART_TEST_CHILD", "1")
+                .env("TOKEN_TRAY_AUTOSTART_TEST_LOG", &log)
+                .output()
+                .expect("run isolated autostart test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            let calls = fs::read_to_string(log).expect("read launchctl calls");
+            assert!(calls.contains("bootstrap"));
+            fs::remove_dir_all(directory).expect("remove fixture directory");
+        }
     }
 }
 

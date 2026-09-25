@@ -162,7 +162,15 @@ impl UsageStore {
             .sync_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let source_files = discover_source_files();
+        let (source_files, discovery_unavailable) = discover_source_files();
+        self.sync_sources(source_files, discovery_unavailable)
+    }
+
+    fn sync_sources(
+        &self,
+        source_files: Vec<SourceFile>,
+        discovery_unavailable: bool,
+    ) -> SyncResult {
         let source_file_count = source_files.len();
         let mut cached_files = self
             .inner
@@ -172,13 +180,16 @@ impl UsageStore {
         let mut next_cache = HashMap::with_capacity(source_files.len());
         let mut accumulator = UsageAccumulator::default();
         let mut readable_files = 0;
-        let mut saw_unavailable = false;
+        let mut saw_unavailable = discovery_unavailable;
         let mut saw_unsupported = false;
 
         for source in source_files {
             let metadata = match fs::metadata(&source.path) {
                 Ok(metadata) if metadata.is_file() => metadata,
-                Ok(_) => continue,
+                Ok(_) => {
+                    saw_unavailable = true;
+                    continue;
+                }
                 Err(_) => {
                     saw_unavailable = true;
                     continue;
@@ -212,14 +223,14 @@ impl UsageStore {
         *cached_files = next_cache;
         drop(cached_files);
 
-        let result = if readable_files > 0 {
+        let result = if saw_unavailable {
+            Err(SyncStatus::LocalFilesUnavailable)
+        } else if saw_unsupported {
+            Err(SyncStatus::UnsupportedFormat)
+        } else if readable_files > 0 {
             Ok(accumulator.finish())
         } else if source_file_count == 0 {
             Err(SyncStatus::LocalFilesNotFound)
-        } else if saw_unsupported {
-            Err(SyncStatus::UnsupportedFormat)
-        } else if saw_unavailable {
-            Err(SyncStatus::LocalFilesUnavailable)
         } else {
             Err(SyncStatus::ReadFailed)
         };
@@ -379,33 +390,37 @@ struct SourceFile {
     kind: SourceKind,
 }
 
-fn discover_source_files() -> Vec<SourceFile> {
+fn discover_source_files() -> (Vec<SourceFile>, bool) {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
+    let mut unavailable = false;
     for root in claude_roots() {
-        collect_jsonl_files(
+        unavailable |= collect_jsonl_files(
             &claude_projects_root(&root),
             SourceKind::Claude,
             &mut files,
             &mut seen,
+            true,
         );
     }
     if let Some(root) = source_root(CODEX_HOME_ENV, ".codex") {
-        collect_jsonl_files(
+        unavailable |= collect_jsonl_files(
             &root.join("sessions"),
             SourceKind::Codex,
             &mut files,
             &mut seen,
+            true,
         );
-        collect_jsonl_files(
+        unavailable |= collect_jsonl_files(
             &root.join("archived_sessions"),
             SourceKind::Codex,
             &mut files,
             &mut seen,
+            true,
         );
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
-    files
+    (files, unavailable)
 }
 
 fn claude_projects_root(root: &Path) -> PathBuf {
@@ -456,17 +471,31 @@ fn collect_jsonl_files(
     kind: SourceKind,
     output: &mut Vec<SourceFile>,
     seen: &mut HashSet<PathBuf>,
-) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
+    allow_missing: bool,
+) -> bool {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return false
+        }
+        Err(_) => return true,
     };
-    for entry in entries.flatten() {
+    let mut unavailable = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                unavailable = true;
+                continue;
+            }
+        };
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
+            unavailable = true;
             continue;
         };
         if file_type.is_dir() {
-            collect_jsonl_files(&path, kind, output, seen);
+            unavailable |= collect_jsonl_files(&path, kind, output, seen, false);
         } else if file_type.is_file()
             && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
             && seen.insert(path.clone())
@@ -474,6 +503,7 @@ fn collect_jsonl_files(
             output.push(SourceFile { path, kind });
         }
     }
+    unavailable
 }
 
 fn read_source_file(source: &SourceFile) -> Result<Vec<DailyAppRow>, SyncStatus> {
@@ -901,7 +931,7 @@ fn add_totals(target: &mut TokenTotals, source: &TokenTotals) {
 mod tests {
     use super::{
         format_tokens, parse_claude_record, parse_codex_record, read_source_file, SourceFile,
-        SourceKind,
+        SourceKind, SyncStatus, UsageStore,
     };
     use serde_json::json;
     use std::fs;
@@ -970,6 +1000,63 @@ mod tests {
         let _ = fs::remove_file(path);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].totals.total_tokens, 130);
+    }
+
+    #[test]
+    fn keeps_last_complete_usage_when_a_source_disappears() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("token-tray-usage-{timestamp}"));
+        fs::create_dir(&directory).expect("create fixture directory");
+        let first = directory.join("first.jsonl");
+        let second = directory.join("second.jsonl");
+        let record = json!({
+            "type": "assistant",
+            "timestamp": "2026-09-17T12:00:00.000Z",
+            "message": { "usage": { "input_tokens": 100, "output_tokens": 10 } }
+        });
+        fs::write(&first, format!("{record}\n")).expect("write first fixture");
+        fs::write(&second, format!("{record}\n")).expect("write second fixture");
+
+        let sources = || {
+            vec![
+                SourceFile {
+                    path: first.clone(),
+                    kind: SourceKind::Claude,
+                },
+                SourceFile {
+                    path: second.clone(),
+                    kind: SourceKind::Claude,
+                },
+            ]
+        };
+        let store = UsageStore::default();
+        let complete = store.sync_sources(sources(), false);
+        assert_eq!(complete.status, SyncStatus::Success);
+        assert_eq!(complete.update.snapshot.total.total_tokens, 220);
+
+        fs::remove_file(&second).expect("remove second fixture");
+        let partial = store.sync_sources(sources(), false);
+        assert_eq!(partial.status, SyncStatus::LocalFilesUnavailable);
+        assert_eq!(partial.update.snapshot.total.total_tokens, 220);
+        assert_eq!(
+            partial.update.last_synced_at,
+            complete.update.last_synced_at
+        );
+        assert!(partial.update.error.is_some());
+
+        let discovery_failed = store.sync_sources(
+            vec![SourceFile {
+                path: first,
+                kind: SourceKind::Claude,
+            }],
+            true,
+        );
+        assert_eq!(discovery_failed.status, SyncStatus::LocalFilesUnavailable);
+        assert_eq!(discovery_failed.update.snapshot.total.total_tokens, 220);
+        fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[test]
